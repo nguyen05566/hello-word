@@ -32,20 +32,92 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Cai dat thu vien
+      # ---------- 1. CAI DAT THU VIEN HE THONG ----------
+      - name: Cai dat thu vien he thong
         run: |
-          python -m pip install --upgrade pip
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential gcc g++ make git curl wget unzip python3-dev
+          echo "=== GCC ==="
+          gcc --version | head -n1
+          echo "=== CPU flags (kiem tra AVX2/BMI2) ==="
+          grep -o -m1 'avx2\|bmi2' /proc/cpuinfo | sort -u || echo "khong thay avx2/bmi2"
+
+      # ---------- 2. CAI DAT THU VIEN PYTHON ----------
+      - name: Cai dat thu vien Python
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
-          echo "=== Da cai dat ==="
+          echo "=== Danh sach thu vien da cai ==="
           pip list
 
+      # ---------- 3. BUILD ENGINE AB-JCHESS ----------
+      - name: Cache AB-JChess engine
+        id: cache-engine
+        uses: actions/cache@v4
+        with:
+          path: |
+            AB-JChess
+            abjchess-*.nnue
+          key: abjchess-bmi2-v0.2d
+
+      - name: Build AB-JChess engine (Linux bmi2)
+        if: steps.cache-engine.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/lxsgx23/AB-JChess.git abjchess-src
+          cd abjchess-src
+
+          # ---- Build binary (uu tien bmi2, fallback x86-64 binh thuong) ----
+          if make -j"$(nproc)" build ARCH=x86-64-bmi2 COMP=gcc; then
+            echo "Build OK: x86-64-bmi2"
+          else
+            echo "bmi2 loi -> thu ARCH=x86-64"
+            make -j"$(nproc)" build ARCH=x86-64 COMP=gcc
+          fi
+
+          # ---- Tim binary vua build ----
+          BIN="$(find . -type f -name 'AB-JChess*' -not -name '*.nnue' | head -n1)"
+          if [ -z "$BIN" ]; then
+            BIN="$(find . -type f -executable -size +1M | head -n1)"
+          fi
+          echo "Binary tim thay: $BIN"
+          cp "$BIN" "$GITHUB_WORKSPACE/AB-JChess"
+          chmod +x "$GITHUB_WORKSPACE/AB-JChess"
+
+          # ---- Tim / tai file NNUE (bat buoc) ----
+          NNUE="$(find . -type f -name 'abjchess-*.nnue' | head -n1)"
+          if [ -z "$NNUE" ]; then
+            echo "Tim NNUE trong release v0.2d..."
+            ZIP_URL=$(curl -s https://api.github.com/repos/lxsgx23/AB-JChess/releases/latest \
+              | grep -o '"browser_download_url": *"[^"]*bmi2[^"]*\.zip"' \
+              | head -n1 | sed 's/.*"\(https[^"]*\)"/\1/')
+            if [ -n "$ZIP_URL" ]; then
+              curl -sL -o /tmp/abj.zip "$ZIP_URL"
+              unzip -o -q /tmp/abj.zip -d /tmp/abj
+              NNUE="$(find /tmp/abj -type f -name 'abjchess-*.nnue' | head -n1)"
+            fi
+          fi
+          if [ -n "$NNUE" ]; then
+            cp "$NNUE" "$GITHUB_WORKSPACE/$(basename "$NNUE")"
+            echo "NNUE: $(basename "$NNUE")"
+          else
+            echo "⚠️ KHONG TIM THAY NNUE — bot se chay khong engine"
+          fi
+
+          cd "$GITHUB_WORKSPACE"
+          ls -la AB-JChess abjchess-*.nnue 2>/dev/null || true
+          ./AB-JChess <<< "quit" || true
+
+      # ---------- 4. CHUAN BI FILE BOT + KIEM TRA ----------
       - name: Chuan bi file bot
         run: |
           # uu tien file day du da upload; neu thieu thi ghep tu parts/
           if [ ! -f cup_bot_hoanchinh.py ]; then
             bash assemble.sh
           fi
-          ls -la cup_bot_hoanchinh.py
+          chmod +x AB-JChess 2>/dev/null || true
+          ls -la cup_bot_hoanchinh.py AB-JChess abjchess-*.nnue 2>/dev/null || true
           wc -l cup_bot_hoanchinh.py
 
       - name: Kiem tra cu phap
@@ -53,6 +125,7 @@ jobs:
           python -m py_compile cup_bot_hoanchinh.py
           echo "Syntax OK"
 
+      # ---------- 5. CHAY BOT ----------
       - name: Chay bot
         if: ${{ github.event_name == 'push' || inputs.run_mode == 'full' }}
         env:
