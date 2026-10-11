@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       run_mode:
-        description: 'che do chay: full (chay bot) hoac check (cai + kiem tra cu phap)'
+        description: 'che do chay: full (chay bot) hoac check (cài + kiem tra cu phap)'
         required: false
         default: 'full'
 
@@ -39,10 +39,14 @@ jobs:
           echo "=== Da cai dat ==="
           pip list
 
-      - name: Ghep file (parts -> cup_bot_hoanchinh.py)
+      - name: Chuan bi file bot
         run: |
-          bash assemble.sh
-          ls -la
+          # uu tien file day du da upload; neu thieu thi ghep tu parts/
+          if [ ! -f cup_bot_hoanchinh.py ]; then
+            bash assemble.sh
+          fi
+          ls -la cup_bot_hoanchinh.py
+          wc -l cup_bot_hoanchinh.py
 
       - name: Kiem tra cu phap
         run: |
