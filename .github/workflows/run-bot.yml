@@ -51,7 +51,7 @@ jobs:
           echo "=== Danh sach thu vien da cai ==="
           pip list
 
-      # ---------- 3. BUILD ENGINE AB-JCHESS ----------
+      # ---------- 3. BUILD ENGINE AB-JCHESS (khong chan neu that bai) ----------
       - name: Cache AB-JChess engine
         id: cache-engine
         uses: actions/cache@v4
@@ -63,9 +63,14 @@ jobs:
 
       - name: Build AB-JChess engine (Linux bmi2)
         if: steps.cache-engine.outputs.cache-hit != 'true'
+        continue-on-error: true
         run: |
-          set -e
-          git clone --depth 1 https://github.com/lxsgx23/AB-JChess.git abjchess-src
+          set +e
+          echo "=== Clone AB-JChess ==="
+          if ! git clone --depth 1 https://github.com/lxsgx23/AB-JChess.git abjchess-src; then
+            echo "⚠️ KHONG CLONE DUOC repo AB-JChess -> bo qua, bot chay khong engine"
+            exit 0
+          fi
           cd abjchess-src
 
           # ---- Build binary (uu tien bmi2, fallback x86-64 binh thuong) ----
@@ -81,14 +86,18 @@ jobs:
           if [ -z "$BIN" ]; then
             BIN="$(find . -type f -executable -size +1M | head -n1)"
           fi
-          echo "Binary tim thay: $BIN"
-          cp "$BIN" "$GITHUB_WORKSPACE/AB-JChess"
-          chmod +x "$GITHUB_WORKSPACE/AB-JChess"
+          if [ -n "$BIN" ]; then
+            echo "Binary tim thay: $BIN"
+            cp "$BIN" "$GITHUB_WORKSPACE/AB-JChess"
+            chmod +x "$GITHUB_WORKSPACE/AB-JChess"
+          else
+            echo "⚠️ Khong tim thay binary sau khi build"
+          fi
 
           # ---- Tim / tai file NNUE (bat buoc) ----
           NNUE="$(find . -type f -name 'abjchess-*.nnue' | head -n1)"
           if [ -z "$NNUE" ]; then
-            echo "Tim NNUE trong release v0.2d..."
+            echo "Tim NNUE trong release..."
             ZIP_URL=$(curl -s https://api.github.com/repos/lxsgx23/AB-JChess/releases/latest \
               | grep -o '"browser_download_url": *"[^"]*bmi2[^"]*\.zip"' \
               | head -n1 | sed 's/.*"\(https[^"]*\)"/\1/')
@@ -106,8 +115,9 @@ jobs:
           fi
 
           cd "$GITHUB_WORKSPACE"
-          ls -la AB-JChess abjchess-*.nnue 2>/dev/null || true
+          ls -la AB-JChess abjchess-*.nnue 2>/dev/null
           ./AB-JChess <<< "quit" || true
+          exit 0
 
       # ---------- 4. CHUAN BI FILE BOT + KIEM TRA ----------
       - name: Chuan bi file bot
@@ -117,7 +127,7 @@ jobs:
             bash assemble.sh
           fi
           chmod +x AB-JChess 2>/dev/null || true
-          ls -la cup_bot_hoanchinh.py AB-JChess abjchess-*.nnue 2>/dev/null || true
+          ls -la cup_bot_hoanchinh.py AB-JChess abjchess-*.nnue 2>/dev/null || echo "(khong co engine/NNUE)"
           wc -l cup_bot_hoanchinh.py
 
       - name: Kiem tra cu phap
