@@ -1,0 +1,61 @@
+name: Cai dat thu vien & Chay Bot
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'che do chay: full (chay bot) hoac check (cai + kiem tra cu phap)'
+        required: false
+        default: 'full'
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cai dat thu vien
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "=== Da cai dat ==="
+          pip list
+
+      - name: Ghep file (parts -> cup_bot_hoanchinh.py)
+        run: |
+          bash assemble.sh
+          ls -la
+
+      - name: Kiem tra cu phap
+        run: |
+          python -m py_compile cup_bot_hoanchinh.py
+          echo "Syntax OK"
+
+      - name: Chay bot
+        if: ${{ github.event_name == 'push' || inputs.run_mode == 'full' }}
+        env:
+          CARO_USER19: ${{ secrets.CARO_USER19 }}
+          CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
+          MISTBOARD_ABJCHESS_ENGINE: ${{ secrets.MISTBOARD_ABJCHESS_ENGINE }}
+          MISTBOARD_ABJCHESS_NNUE: ${{ secrets.MISTBOARD_ABJCHESS_NNUE }}
+        run: |
+          # Bot chay vong lap vo han -> gioi han 10 phut moi lan CI
+          timeout 600 python cup_bot_hoanchinh.py || true
