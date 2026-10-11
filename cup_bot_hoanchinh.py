@@ -1124,6 +1124,9 @@ class JieqiCupBot:
         self._table_path_ts = 0.0
         self._reconnect_streak = 0
         self._connected_since = 0.0
+        self._closing = False
+        self._keep_alive_started = False
+        self._login_retry_count = 0
         self._enter_fail_at = 0.0
         self.player_names = {}
         self._thinking = False
@@ -1149,31 +1152,109 @@ class JieqiCupBot:
         else:
             print("[BOT] ✅ AB-JChess 0.2d ready")
 
+    # =====================================================================
+    # WS LIFECYCLE — FIX MẤT KẾT NỐI WEBSOCKET
+    # 3 nguyên nhân khiến bot "mất kết nối" trước đây:
+    #  1) Thread/callback của ws CŨ còn sống sau khi đã mở ws MỚI -> on_close
+    #     của ws cũ set connected=False làm rớt ws mới ngay lập tức.
+    #  2) Socket chết lặng (không FIN, không pong) -> on_close không bao giờ
+#     gọi tới -> run() kẹt ở nhánh "vẫn connected", không bao giờ reconnect.
+    #  3) Mỗi lần reconnect lại spawn thêm 1 thread keep-alive + 1 thread
+    #     run_forever mới (rò rỉ, nhiều thread PING song song).
+    # =====================================================================
+    def _is_stale(self, ws):
+        """Callback đến từ WebSocketApp ĐÃ BỊ THAY THẾ -> phải bỏ qua."""
+        return ws is not None and self.ws is not None and ws is not self.ws
+
+    def _disconnect(self, reason=""):
+        """Chủ động đóng ws hiện tại và ép connected=False.
+
+        Không phụ thuộc on_close: kể cả khi socket chết lặng (on_close không
+        được gọi), run() vẫn thấy connected=False và reconnect ngay.
+        """
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if reason:
+                print(f"[WS] 🔌 Ngắt kết nối: {reason}", flush=True)
+            ws = self.ws
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            self.connected = False
+            self.logged_in = False
+        finally:
+            self._closing = False
+
     def connect(self):
         import websocket
+        old_ws = self.ws
+        if old_ws is not None:
+            try:
+                old_ws.close()
+            except Exception:
+                pass
+        old_thread = getattr(self, "ws_thread", None)
+        if old_thread is not None and old_thread.is_alive():
+            # Đợi thread ws cũ thoát hẳn — tránh 2 thread run_forever cùng
+            # chạy: thread cũ đóng sau sẽ set connected=False làm rớt ws mới.
+            old_thread.join(timeout=5)
         self.connected = False
-        self.ws = websocket.WebSocketApp(
+        app = websocket.WebSocketApp(
             WS_URL, cookie=COOKIE,
             on_open=self._on_open, on_message=self._on_message,
             on_error=self._on_error, on_close=self._on_close,
+            on_ping=self._on_ping, on_pong=self._on_pong,
             header={"Origin": "https://gamevh.net"})
+        self.ws = app
         self.ws_thread = threading.Thread(
-            target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=None),
+            target=lambda: app.run_forever(ping_interval=20, ping_timeout=None),
             daemon=True)
         self.ws_thread.start()
-        for _ in range(25):
-            if self.connected: break
+        for _ in range(75):          # chờ tối đa 15s (bản cũ chỉ 5s)
+            if self.connected:
+                break
+            if not self.ws_thread.is_alive():
+                print("[WS] ❌ Thread thoát trước khi mở kết nối", flush=True)
+                break
             time.sleep(0.2)
         return self.connected
 
     def _on_open(self, ws):
+        if self._is_stale(ws):
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
         self.connected = True
         self.last_action_timestamp = time.time()
         self.last_recv_timestamp = time.time()
         self._connected_since = time.time()
         self._send_login()
 
+    def _on_ping(self, ws, message):
+        """Server ping -> kết nối còn sống; trả pong ngay (nếu lib chưa làm)."""
+        if self._is_stale(ws):
+            return
+        self.last_recv_timestamp = time.time()
+        try:
+            ws.pong(message)
+        except Exception:
+            pass
+
+    def _on_pong(self, ws, message):
+        """Pong từ server (phản hồi ping của bot) -> kết nối thật sự còn sống."""
+        if self._is_stale(ws):
+            return
+        self.last_recv_timestamp = time.time()
+
     def _on_message(self, ws, message):
+        if self._is_stale(ws):
+            return
         self.last_recv_timestamp = time.time()
         if isinstance(message, bytes):
             # Decode once and make the parsed event available to handlers.
@@ -1187,9 +1268,16 @@ class JieqiCupBot:
             self._handle_binary_message(message)
 
     def _on_error(self, ws, error):
+        if self._is_stale(ws):
+            return
         print(f"[WS] ❌ Error: {type(error).__name__}: {error}")
+        # Lỗi socket thường đi kèm kết nối đã hỏng -> đóng NGAY để run()
+        # reconnect, thay vì chờ hết 60-120s mới phát hiện.
+        self._disconnect(f"error: {type(error).__name__}: {error}")
 
     def _on_close(self, ws, code, msg):
+        if self._is_stale(ws):
+            return                      # ws cũ đóng -> không phá state ws mới
         if self.board.is_playing:
             print(f"[WS] ⚠️ DISCONNECTED INGAME (code={code})")
         else:
@@ -1214,8 +1302,13 @@ class JieqiCupBot:
         if self.ws and self.connected:
             try:
                 self.ws.send(self.conn.pack(cmd, data), opcode=0x2)
-            except Exception:
-                pass
+                return True
+            except Exception as e:
+                # Socket đã chết mà vẫn im lặng: nếu nuốt lỗi như bản cũ thì
+                # bot "nghĩ" là còn kết nối và treo tới tận 60-120s mới reconnect.
+                print(f"[WS] send '{cmd}' lỗi: {type(e).__name__}: {e}", flush=True)
+                self._disconnect(f"send {cmd} fail")
+        return False
 
     def _send_login(self):
         data = bytearray()
@@ -1373,14 +1466,33 @@ class JieqiCupBot:
             traceback.print_exc()
 
     def _handle_login_response(self, msg):
-        if msg.read_byte() == 0:
+        status = msg.read_byte()
+        if status == 0:
+            self._login_retry_count = 0
             self.logged_in = True
             path = msg.read_string()
             if path == 'REFRESH':
-                fetch_session_info()
-                self._send_login()
+                if fetch_session_info():
+                    self._send_login()
+                else:
+                    self._disconnect("session REFRESH failed")
                 return
             self.send_enter_place()
+            return
+        # Server từ chối login (token hết hạn / phiên sai...). Bản cũ im lặng
+        # hoàn toàn -> bot treo mãi ở trạng thái "connected nhưng chưa login".
+        print(f"[LOGIN] ❌ status={status} -> làm lại session", flush=True)
+        self._login_retry_count += 1
+        if self._login_retry_count <= 3:
+            def _retry_login():
+                time.sleep(2.0)
+                if fetch_session_info():
+                    self._send_login()
+                else:
+                    self._disconnect("login retry failed")
+            threading.Thread(target=_retry_login, daemon=True).start()
+        else:
+            self._disconnect(f"login failed status={status}")
 
     def _handle_enter_place_response(self, msg):
         status = msg.read_byte()
@@ -1903,10 +2015,19 @@ class JieqiCupBot:
         return f"{color}{encoded_id >> 3}{'' if (encoded_id & 7) == 0 else (encoded_id & 7)}"
 
     def start_keep_alive(self):
+        # 1 thread PING sống suốt đời — bản cũ sinh thread MỚI mỗi lần
+        # reconnect (khi reconnect liên tục sẽ có nhiều thread PING song song,
+        # traffic gấp đôi, server dễ đóng kết nối vì spam).
+        if self._keep_alive_started:
+            return
+        self._keep_alive_started = True
+
         def loop():
-            while self.connected:
+            while True:
                 time.sleep(10)
-                if self.connected: self.send_message("PING")
+                if self.connected:
+                    self.send_message("PING")
+
         threading.Thread(target=loop, daemon=True).start()
 
     def run(self):
@@ -1914,19 +2035,25 @@ class JieqiCupBot:
         while True:
             try:
                 now_ts = time.time()
-                if self.connected and now_ts - self.last_recv_timestamp > 120:
-                    print("[WS] 120s không nhận dữ liệu -> kết nối lại")
-                    if self.ws:
-                        try: self.ws.close()
-                        except: pass
-                    time.sleep(2)
-                elif self.connected and self.board.is_playing:
-                    if now_ts - self.last_action_timestamp > 300:
-                        print("[WS] Ván treo 300s -> kết nối lại")
-                        if self.ws:
-                            try: self.ws.close()
-                            except: pass
-                        time.sleep(2)
+                if self.connected:
+                    idle = now_ts - self.last_recv_timestamp
+                    # Trong ván luôn có traffic (PING/PONG, SET_TURN, MOVE...)
+                    # -> 60s im lặng = connection chết lặng, reconnect ngay.
+                    # Ngoài ván (ngồi bàn chờ) giữ 120s như cũ để tránh
+                    # reconnect oan khi server không trả lời app-PING.
+                    idle_limit = 60 if self.board.is_playing else 120
+                    if idle > idle_limit:
+                        self._disconnect(f"{int(idle)}s không nhận frame nào")
+                    elif (self._connected_since
+                          and not self.logged_in
+                          and now_ts - self._connected_since > 45):
+                        # Connected nhưng login treo (token sai / server im lặng)
+                        # -> bản cũ treo vĩnh viễn, không bao giờ reconnect.
+                        self._disconnect("45s chưa login xong")
+                    elif (self.board.is_playing
+                          and now_ts - self.last_action_timestamp > 300):
+                        self._disconnect(
+                            f"ván treo {int(now_ts - self.last_action_timestamp)}s")
 
                 if not self.connected:
                     if self._reconnect_streak >= 3:
