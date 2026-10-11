@@ -4,11 +4,9 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
-    inputs:
-      run_mode:
-        description: 'che do chay: full (chay bot) hoac check (cài + kiem tra cu phap)'
-        required: false
-        default: 'full'
+
+env:
+  ABJ_ZIP_URL: https://github.com/lxsgx23/AB-JChess/releases/download/v0.2b/0.2b_bmi2.zip
 
 jobs:
   build-and-run:
@@ -36,100 +34,85 @@ jobs:
       - name: Cai dat thu vien he thong
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            build-essential gcc g++ make git curl wget unzip python3-dev
-          echo "=== GCC ==="
-          gcc --version | head -n1
-          echo "=== CPU flags (kiem tra AVX2/BMI2) ==="
-          grep -o -m1 'avx2\|bmi2' /proc/cpuinfo | sort -u || echo "khong thay avx2/bmi2"
+          sudo apt-get install -y -qq build-essential clang git curl unzip tar
+          clang --version | head -n1
 
       # ---------- 2. CAI DAT THU VIEN PYTHON ----------
       - name: Cai dat thu vien Python
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
-          echo "=== Danh sach thu vien da cai ==="
           pip list
 
-      # ---------- 3. BUILD ENGINE AB-JCHESS (khong chan neu that bai) ----------
-      - name: Cache AB-JChess engine
+      # ---------- 3. LAY ENGINE AB-JChess + NNUE ----------
+      - name: Cache AB-JChess
         id: cache-engine
         uses: actions/cache@v4
         with:
           path: |
             AB-JChess
             abjchess-*.nnue
-          key: abjchess-bmi2-v0.2d
+          key: abjchess-v0.2b-avx2
 
-      - name: Build AB-JChess engine (Linux bmi2)
+      # BUOC 3a: binary build san trong mistboard release (nhanh nhat)
+      - name: Tai AB-JChess tu mistboard release
         if: steps.cache-engine.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          API="https://api.github.com/repos/brianhliou/mistboard/releases?per_page=100"
+          TAG=$(curl -fsSL "$API" | grep -o '"tag_name": *"engines-[^"]*"' | head -1 | sed 's/.*"\(engines-[^"]*\)"/\1/')
+          echo "Tag tim thay: $TAG"
+          test -n "$TAG"
+          curl -fsSL --retry 3 -o /tmp/eng.tar.gz \
+            "https://github.com/brianhliou/mistboard/releases/download/$TAG/engines-x86-64-sse41-popcnt.tar.gz"
+          tar -xzf /tmp/eng.tar.gz -C /tmp ab-jchess
+          cp /tmp/ab-jchess "$GITHUB_WORKSPACE/AB-JChess"
+          chmod +x "$GITHUB_WORKSPACE/AB-JChess"
+          echo "✅ Binary lay tu mistboard release $TAG"
+
+      # BUOC 3b: fallback build tu source (pin cua mistboard ab-jchess.ref)
+      - name: Build AB-JChess tu source (fallback)
+        if: always() && hashFiles('AB-JChess') == ''
         continue-on-error: true
         run: |
-          set +e
-          echo "=== Clone AB-JChess ==="
-          if ! git clone --depth 1 https://github.com/lxsgx23/AB-JChess.git abjchess-src; then
-            echo "⚠️ KHONG CLONE DUOC repo AB-JChess -> bo qua, bot chay khong engine"
-            exit 0
-          fi
-          cd abjchess-src
-
-          # ---- Build binary (uu tien bmi2, fallback x86-64 binh thuong) ----
-          if make -j"$(nproc)" build ARCH=x86-64-bmi2 COMP=gcc; then
-            echo "Build OK: x86-64-bmi2"
-          else
-            echo "bmi2 loi -> thu ARCH=x86-64"
-            make -j"$(nproc)" build ARCH=x86-64 COMP=gcc
-          fi
-
-          # ---- Tim binary vua build ----
-          BIN="$(find . -type f -name 'AB-JChess*' -not -name '*.nnue' | head -n1)"
-          if [ -z "$BIN" ]; then
-            BIN="$(find . -type f -executable -size +1M | head -n1)"
-          fi
-          if [ -n "$BIN" ]; then
-            echo "Binary tim thay: $BIN"
-            cp "$BIN" "$GITHUB_WORKSPACE/AB-JChess"
+          work=$(mktemp -d)
+          git init -q "$work/abjchess"
+          git -C "$work/abjchess" fetch -q --depth 1 \
+            https://github.com/lxsgx23/AB-JChess.git 1ae95ca6a960fc0caf32e791a67c8438aab60483
+          git -C "$work/abjchess" checkout -q FETCH_HEAD
+          make -C "$work/abjchess/src" -j"$(nproc)" ARCH=x86-64-avx2 COMP=clang EXTRALDFLAGS=-static build \
+            || make -C "$work/abjchess/src" -j"$(nproc)" ARCH=x86-64-bmi2 COMP=gcc build
+          if [ -f "$work/abjchess/src/AB-JChess" ]; then
+            cp "$work/abjchess/src/AB-JChess" "$GITHUB_WORKSPACE/AB-JChess"
             chmod +x "$GITHUB_WORKSPACE/AB-JChess"
-          else
-            echo "⚠️ Khong tim thay binary sau khi build"
+            echo "✅ Da build tu source"
           fi
+          rm -rf "$work"
 
-          # ---- Tim / tai file NNUE (bat buoc) ----
-          NNUE="$(find . -type f -name 'abjchess-*.nnue' | head -n1)"
-          if [ -z "$NNUE" ]; then
-            echo "Tim NNUE trong release..."
-            ZIP_URL=$(curl -s https://api.github.com/repos/lxsgx23/AB-JChess/releases/latest \
-              | grep -o '"browser_download_url": *"[^"]*bmi2[^"]*\.zip"' \
-              | head -n1 | sed 's/.*"\(https[^"]*\)"/\1/')
-            if [ -n "$ZIP_URL" ]; then
-              curl -sL -o /tmp/abj.zip "$ZIP_URL"
-              unzip -o -q /tmp/abj.zip -d /tmp/abj
-              NNUE="$(find /tmp/abj -type f -name 'abjchess-*.nnue' | head -n1)"
-            fi
-          fi
-          if [ -n "$NNUE" ]; then
-            cp "$NNUE" "$GITHUB_WORKSPACE/$(basename "$NNUE")"
-            echo "NNUE: $(basename "$NNUE")"
-          else
-            echo "⚠️ KHONG TIM THAY NNUE — bot se chay khong engine"
-          fi
-
-          cd "$GITHUB_WORKSPACE"
-          ls -la AB-JChess abjchess-*.nnue 2>/dev/null
-          ./AB-JChess <<< "quit" || true
-          exit 0
-
-      # ---------- 4. CHUAN BI FILE BOT + KIEM TRA ----------
-      - name: Chuan bi file bot
+      # BUOC 3c: NNUE bat buoc (tai tu release tac gia, khong re-host)
+      - name: Tai NNUE (bat buoc)
+        if: steps.cache-engine.outputs.cache-hit != 'true'
         run: |
-          # uu tien file day du da upload; neu thieu thi ghep tu parts/
-          if [ ! -f cup_bot_hoanchinh.py ]; then
-            bash assemble.sh
-          fi
-          chmod +x AB-JChess 2>/dev/null || true
-          ls -la cup_bot_hoanchinh.py AB-JChess abjchess-*.nnue 2>/dev/null || echo "(khong co engine/NNUE)"
-          wc -l cup_bot_hoanchinh.py
+          set -e
+          curl -fsSL --retry 3 -o /tmp/abj.zip "$ABJ_ZIP_URL"
+          unzip -o -q /tmp/abj.zip -d /tmp/net
+          NNUE=$(find /tmp/net -name 'abjchess-*.nnue' | head -n1)
+          test -n "$NNUE"
+          cp "$NNUE" "$GITHUB_WORKSPACE/$(basename "$NNUE")"
+          echo "✅ NNUE: $(basename "$NNUE")"
 
+      # KIEM TRA NGHIEM NGAT: thieu engine/NNUE la CI do ngay, khong chay bot lang phi
+      - name: Smoke test engine
+        run: |
+          set -e
+          chmod +x AB-JChess
+          ls -la AB-JChess *.nnue
+          printf 'uci\nquit\n' | timeout 20 ./AB-JChess | head -n 8
+          test -s AB-JChess
+          ls *.nnue > /dev/null
+          echo "✅ Engine OK"
+
+      # ---------- 4. KIEM TRA CU PHAP BOT ----------
       - name: Kiem tra cu phap
         run: |
           python -m py_compile cup_bot_hoanchinh.py
@@ -137,12 +120,8 @@ jobs:
 
       # ---------- 5. CHAY BOT ----------
       - name: Chay bot
-        if: ${{ github.event_name == 'push' || inputs.run_mode == 'full' }}
         env:
           CARO_USER19: ${{ secrets.CARO_USER19 }}
           CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
-          MISTBOARD_ABJCHESS_ENGINE: ${{ secrets.MISTBOARD_ABJCHESS_ENGINE }}
-          MISTBOARD_ABJCHESS_NNUE: ${{ secrets.MISTBOARD_ABJCHESS_NNUE }}
         run: |
-          # Bot chay vong lap vo han -> gioi han 10 phut moi lan CI
           timeout 600 python cup_bot_hoanchinh.py || true
