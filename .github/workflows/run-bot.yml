@@ -11,7 +11,8 @@ env:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # gia han toi da 6h; bot chay ~55phut moi lan CI
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -54,7 +55,6 @@ jobs:
             abjchess-*.nnue
           key: abjchess-v0.2b-avx2
 
-      # BUOC 3a: binary build san trong mistboard release (nhanh nhat)
       - name: Tai AB-JChess tu mistboard release
         if: steps.cache-engine.outputs.cache-hit != 'true'
         run: |
@@ -66,11 +66,11 @@ jobs:
           curl -fsSL --retry 3 -o /tmp/eng.tar.gz \
             "https://github.com/brianhliou/mistboard/releases/download/$TAG/engines-x86-64-sse41-popcnt.tar.gz"
           tar -xzf /tmp/eng.tar.gz -C /tmp ab-jchess
+          cp /tmp/abjickess /dev/null 2>/dev/null || true
           cp /tmp/ab-jchess "$GITHUB_WORKSPACE/AB-JChess"
           chmod +x "$GITHUB_WORKSPACE/AB-JChess"
           echo "✅ Binary lay tu mistboard release $TAG"
 
-      # BUOC 3b: fallback build tu source (pin cua mistboard ab-jchess.ref)
       - name: Build AB-JChess tu source (fallback)
         if: always() && hashFiles('AB-JChess') == ''
         continue-on-error: true
@@ -89,7 +89,6 @@ jobs:
           fi
           rm -rf "$work"
 
-      # BUOC 3c: NNUE bat buoc (tai tu release tac gia, khong re-host)
       - name: Tai NNUE (bat buoc)
         if: steps.cache-engine.outputs.cache-hit != 'true'
         run: |
@@ -101,7 +100,6 @@ jobs:
           cp "$NNUE" "$GITHUB_WORKSPACE/$(basename "$NNUE")"
           echo "✅ NNUE: $(basename "$NNUE")"
 
-      # KIEM TRA NGHIEM NGAT: thieu engine/NNUE la CI do ngay, khong chay bot lang phi
       - name: Smoke test engine
         run: |
           set -e
@@ -118,10 +116,13 @@ jobs:
           python -m py_compile cup_bot_hoanchinh.py
           echo "Syntax OK"
 
-      # ---------- 5. CHAY BOT ----------
+      # ---------- 5. CHAY BOT (55 phut, tuong doi) ----------
       - name: Chay bot
         env:
           CARO_USER19: ${{ secrets.CARO_USER19 }}
           CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
         run: |
-          timeout 600 python cup_bot_hoanchinh.py || true
+          # gia han 55 phut de bot khong bi giet giua ván (truoc do chi 10 phut)
+          timeout --signal=INT --kill-after=30 3300 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
+          echo "=== 20 dong cuoi bot.log ==="
+          tail -n 20 bot.log || true
