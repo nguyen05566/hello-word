@@ -1,41 +1,13 @@
 """
 cup_bot_flipchess_abjchess.py — Cờ Úp Bot dùng engine AB-JChess 0.2d build từ mistboard
-Source: https://github.com/lxsgx23/AB-JChess (release v0.2d, 2026-10-10)
-Mistboard integration ref: https://github.com/brianhliou/mistboard/blob/main/ab-jchess.ref
+Tích hợp Maphack MultiPV Filtering: Đảm bảo đi đúng luật server nhưng lật/ăn quân dựa trên mặt thật.
 
 Engine: AB-JChess 0.2d (NNUE-based, Pikafish-derived Jieqi engine)
   - Mạnh hơn PikaJieQi ~90 Elo @ 4s/move (mistboard benchmark)
   - Yêu cầu CPU có AVX2/BMI2 (build với ARCH=x86-64-bmi2)
   - Yêu cầu file NNUE (abjchess-20261010.nnue) — load qua setoption name EvalFile
-Movetime: 2000ms (~2s/nước) — có thể tăng lên 3000ms để tận dụng NNUE
+Movetime: 3000ms (~3s/nước)
 BAG updates: gửi kèm moves list để AB-JChess sync state (giống PikaJieQi)
-
-[ĐẶC ĐIỂM]
-- Binary: AB-JChess (build từ source cho Linux, hoặc download 0.2d_bmi2.zip cho Windows)
-- KHÔNG gửi lệnh setflip (engine không hỗ trợ; bot tự track flip phía Python)
-  (giống PikaJieQi — AB-JChess cùng encode dark state vào FEN BAG field)
-- NNUE BẮT BUỘC: file abjchess-20261010.nnue phải nằm cùng thư mục với binary
-  (PikaJieQi dùng classical eval, không cần NNUE; AB-JChess thì NNUE là cốt lõi)
-- ws_frame_dump.py: parse WS frame từ server, track reveal piece qua raw_face byte
-  → bot biết true piece type của quân úp (lợi thế so với người chơi thường)
-- UCI tương thích ngược với PikaJieQi: cùng FEN BAG format, cùng reveal suffix
-  (c3c4N = dark pawn c3→c4, reveals Knight). Code move-list giữ nguyên.
-
-[ĐÃ BỎ so với cup_bot_mistboard.py gốc]
-- Ally detection (is_family_bot): không né bạn cùng hệ thống
-- Anti-software handler (is_block_software_message): bỏ detection chặn software
-- Table tracking (ACTIVE_TABLES_FILE): bỏ hệ thống đăng ký bàn
-
-[THAY ĐỔI so với cup_bot_flipchess.py bản PikaJieQi]
-- PIKAJIEQI_BINARY_CANDIDATES  -> ABJCHESS_BINARY_CANDIDATES
-- FlipchessJieqiEngine         -> FlipchessAbjchessEngine (giữ alias cho backward compat)
-- Env MISTBOARD_JIEQI_ENGINE   -> MISTBOARD_ABJCHESS_ENGINE (env cũ vẫn fallback)
-- NNUE file pikafish.nnue      -> abjchess-20261010.nnue (BẮT BUỘC, không còn optional)
-- Nếu thiếu NNUE, engine sẽ KHÔNG khởi động được (khác PikaJieQi)
-- Thêm setoption AggressiveLevel=3 và ChasingRule=skyrule_Jieqi (mặc định AB-JChess)
-
-[BẢN NÀY] Bot KHÔNG tự kick/Thoát khi thua — luôn ở lại bàn và ready ván mới.
-Mức cược: 2000 xu (BOT_BET_XU = 2000)
 """
 import struct
 import threading
@@ -55,53 +27,7 @@ import urllib.request, urllib.parse, http.cookiejar
 
 # ============================================================================
 # ws_frame_dump — EMBEDDED (file hoàn chỉnh, không cần ws_frame_dump.py rời)
-# Giải mã WS frame gamevh cờ úp: START_MATCH pieces, MOVE reveal (display_sid,
-# true_face_sid), stateful pos->sid. Nguồn: tái tạo từ frame thô + AB-JChess ref.
 # ============================================================================
-"""
-ws_frame_dump.py — WS binary frame decoder for gamevh cờ úp (mystery_xiangqi).
-
-Cung cấp 2 API cho cup_bot_flipchess_abjchess.py:
-  - decode_frame(data: bytes) -> dict   : parse 1 frame đến, trả event dict
-  - log_incoming_frame(data: bytes)     : ghi hex frame vào ws_frames.log
-
-Wire format (giống InboundMessage trong bot chính):
-  [cmd_len(1, signed)] [cmd ascii | cmd code 2B BE] [payload...]
-  cmd_len < 0  -> tên ascii độ dài -cmd_len
-  cmd_len >= 0 -> code = (cmd_len<<8) | byte_next, tra CMD_NAMES
-
-Payload theo từng lệnh (byte = signed 1B):
-  START_MATCH: player_count(1), {slot(1), id(4)}*N,
-               piece_count(1), {sid(1), face(1), pos(1), is_open(1)}*M,
-               x(1), mystery_count(1), {m(1)}*K, x(1), x(1),
-               first_turn_slot(1), my_slot(1)
-               NOTE: sid == face ở START_MATCH (không lộ mặt thật).
-  MOVE:        source(1), target(1), reveal_count(1),
-               reveal_count x (sid(1), face(1))
-               - pair = (display_sid, true_face_sid) của 1 quân vừa bị lộ mặt
-               - 1 move thường sinh 1 pair (quân đi là quân úp -> lật)
-               - capture quân úp có thể sinh thêm pair (quân bị ăn)
-               - frame sync (sau reconnect) có thể có nhiều pair (full map)
-
-LUẬT GAME (xác nhận từ AB-JChess source + frame capture):
-  - Quân úp đi theo MẶT NẠ (mảnh tiêu chuẩn tại vị trí của nó).
-  - Khi quân úp đi, nó lật lộ MẶT THẬT (identity, lấy từ pool) và sau đó
-    đi theo mặt thật. Thêm suffix identity vào UCI move (vd "c3c4N").
-  - Engine AB-JChess tự track pool/BAG qua suffix — KHÔNG cần setflip.
-
-decode_frame trả về:
-  {"command": <tên lệnh>, ...}
-  START_MATCH -> "pieces": [{"sid_decoded","face_decoded","position","is_open"}, ...]
-  MOVE        -> "source","target","revealed_piece","captured_piece",
-                 "mover_known","stale"
-     revealed_piece  = ký tự FEN mặt thật của quân đi (None nếu không lật)
-     captured_piece  = ký tự FEN mặt thật của quân bị ăn (None nếu không có/không lật)
-     stale           = True nếu frame là replay/state-sync (ô nguồn trống)
-"""
-import os
-import struct
-import time
-
 CMD_NAMES = {
     300: "PONG", 301: "PING", 302: "LOGIN", 303: "ALERT",
     311: "BROADCAST", 314: "SET_CLIENT_MODE", 315: "CONFIG",
@@ -115,7 +41,6 @@ CMD_NAMES = {
 }
 
 PIECE_TYPE_MAP = {1: 'k', 2: 'a', 3: 'b', 4: 'r', 5: 'c', 6: 'n', 7: 'p'}
-
 
 class _Reader:
     def __init__(self, data):
@@ -135,7 +60,6 @@ class _Reader:
     def rem(self):
         return len(self.data) - self.offset
 
-
 def _parse_command(r):
     length = r.read_byte()
     if length < 0:
@@ -148,43 +72,31 @@ def _parse_command(r):
     code = (length << 8) | next_byte
     return CMD_NAMES.get(code, str(code))
 
-
 def _decode_piece_id(encoded_id):
-    """byte -> 'r4' / 'b72' ... (giống _decode_piece_id của bot chính)"""
     color = 'r'
     if encoded_id < 0:
         encoded_id = -encoded_id
         color = 'b'
     return f"{color}{encoded_id >> 3}{'' if (encoded_id & 7) == 0 else (encoded_id & 7)}"
 
-
 def _face_to_fen_char(raw_face):
-    """byte mặt thật -> ký tự FEN ('R','n','p'...) hoặc None"""
     v = raw_face
-    if v == 0:
-        return None
+    if v == 0: return None
     ch = PIECE_TYPE_MAP.get(abs(v) >> 3)
-    if not ch:
-        return None
+    if not ch: return None
     return ch.upper() if v > 0 else ch
 
-
 class _GameState:
-    """Track pos->sid, quân đã lộ mặt, map identity — giữ qua các frame."""
     def __init__(self):
         self.reset()
-
     def reset(self):
-        self.pos_sid = {}       # position -> sid byte (display id)
-        self.revealed = set()   # sid đã lộ mặt (hoặc open ngay từ đầu)
-        self.identity = {}      # sid -> face byte (mặt thật)
-
+        self.pos_sid = {}       
+        self.revealed = set()   
+        self.identity = {}      
 
 _state = _GameState()
 
-
 def decode_frame(data):
-    """Parse 1 binary frame -> event dict. Không raise với frame lạ."""
     try:
         r = _Reader(data)
         cmd = _parse_command(r)
@@ -226,8 +138,7 @@ def decode_frame(data):
             else:
                 return event
             count = r.read_byte() if r.rem() >= 1 else 0
-            if count < 0:
-                count = 0
+            if count < 0: count = 0
             pairs = []
             for _ in range(min(count, r.rem() // 2)):
                 sid = r.read_byte()
@@ -241,14 +152,11 @@ def decode_frame(data):
             captured_char = None
             for sid, face in pairs:
                 ch = _face_to_fen_char(face)
-                if ch in ('k', 'K'):
-                    ch = None
+                if ch in ('k', 'K'): ch = None
                 if sid == mover_sid and sid not in _state.revealed:
-                    if revealed_char is None:
-                        revealed_char = ch
+                    if revealed_char is None: revealed_char = ch
                 elif sid == captured_sid and sid not in _state.revealed:
-                    if captured_char is None:
-                        captured_char = ch
+                    if captured_char is None: captured_char = ch
                 _state.revealed.add(sid)
 
             event["revealed_piece"] = revealed_char
@@ -256,25 +164,18 @@ def decode_frame(data):
             event["mover_known"] = mover_sid is not None
             event["stale"] = bool(_state.pos_sid) and mover_sid is None
 
-            # Cập nhật pos map SAU khi đã match mover/captured
             if mover_sid is not None:
                 if tgt != src:
                     _state.pos_sid.pop(src, None)
                     _state.pos_sid[tgt] = mover_sid
-                # src == tgt (flip move): quân đứng yên, chỉ lật
-
         return event
     except Exception as exc:
         return {"command": "?", "decode_error": f"{type(exc).__name__}: {exc}"}
 
-
-# ---------------------------------------------------------------- logging
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ws_frames.log")
 _LOG_MAX_BYTES = 8 * 1024 * 1024
 
-
 def log_incoming_frame(data):
-    """Ghi hex frame (lazy, capped) để debug protocol."""
     try:
         if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > _LOG_MAX_BYTES:
             return
@@ -289,7 +190,7 @@ def log_incoming_frame(data):
         pass
 
 # ============================================================================
-# HTTP SESSION (giữ nguyên từ cup_bot.py)
+# HTTP SESSION 
 # ============================================================================
 class _UrllibSession:
     def __init__(self):
@@ -306,8 +207,7 @@ class _UrllibSession:
             def __contains__(self, k): return k in self.d
         self.headers = _Headers()
         self.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/139.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0",
             "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.7",
         })
         for k, v in self.headers.d.items():
@@ -344,13 +244,12 @@ class _UrllibSession:
 
 requests = type('R', (), {'Session': _UrllibSession})()
 
-# ==================== TÀI KHOẢN ====================
+# ==================== CẤU HÌNH ====================
 CARO_USER_DIRECT = "ngan27"
 CARO_PASSWD_DIRECT = "$$$$$$"
 
 def _clean_env(val, default):
-    if val and str(val).strip():
-        return str(val).strip()
+    if val and str(val).strip(): return str(val).strip()
     return default
 
 USER = _clean_env(os.environ.get("CARO_USER19"), CARO_USER_DIRECT)
@@ -366,36 +265,19 @@ TOKEN = 0
 GAME_ID = 'mystery_xiangqi'
 PLACE_PATH = 'Lobby.mystery_xiangqi.0'
 
-# === ENGINE CONFIG ===
-# Binary AB-JChess 0.2d build từ repo https://github.com/lxsgx23/AB-JChess
-# (Pikafish-derived Jieqi NNUE engine, stronger than PikaJieQi ~90 Elo)
-# Build cho Linux:  cd abjchess && make -j2 build ARCH=x86-64-bmi2 COMP=gcc
-#   -> tạo ./src/AB-JChess (đặt cùng thư mục với file .py)
-# Download cho Windows: 0.2d_bmi2.zip từ release v0.2d (chứa AB-JChess.exe + .nnue)
-# Đặt cùng thư mục với file .py, hoặc override qua env MISTBOARD_ABJCHESS_ENGINE
 ABJCHESS_BINARY_CANDIDATES = [
-    os.environ.get("MISTBOARD_ABJCHESS_ENGINE", os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "AB-JChess"
-    )),
-    # Tên binary build local từ source (Linux/macOS)
+    os.environ.get("MISTBOARD_ABJCHESS_ENGINE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess")),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess"),
-    # Tên binary Windows trong 0.2d_bmi2.zip (chạy qua wine nếu cần)
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess.exe"),
-    # Alias thường gặp trong mistboard builds
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ab-jchess"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "abjchess"),
-    # Fallback tên cũ (nếu user đặt binary nhầm tên PikaJieQi)
-    os.environ.get("MISTBOARD_JIEQI_ENGINE", ""),  # env cũ của PikaJieQi, dùng làm fallback
+    os.environ.get("MISTBOARD_JIEQI_ENGINE", ""), 
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "PikaJieQi"),
 ]
 ABJCHESS_BINARY_CANDIDATES = [p for p in ABJCHESS_BINARY_CANDIDATES if p]
 
-# AB-JChess 0.2d release ships NNUE file abjchess-20261010.nnue trong 0.2d_bmi2.zip.
-# Đây là BẮT BUỘC — không có NNUE, engine không khởi động được (khác PikaJieQi).
-# Tìm file theo pattern abjchess-*.nnue trong cùng thư mục binary.
 ABJCHESS_NNUE_CANDIDATES = [
     os.environ.get("MISTBOARD_ABJCHESS_NNUE", ""),
-    # Ưu tiên file mới nhất (sort theo tên giảm dần)
 ] + sorted(
     [os.path.join(d, f) for d in [os.path.dirname(os.path.abspath(__file__))]
      for f in os.listdir(d) if f.startswith("abjchess-") and f.endswith(".nnue")],
@@ -403,25 +285,18 @@ ABJCHESS_NNUE_CANDIDATES = [
 )
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
-# Cấu hình engine (giống bản PikaJieQi, thêm 2 option riêng của AB-JChess)
-ENGINE_USE_AGGRESSIVE_LEVEL = 3   # 0..10, default 3 (theo AB-JChess README)
-ENGINE_CHASING_RULE = "skyrule_Jieqi"  # default của AB-JChess
-
-ENGINE_MULTIPV = 1
+ENGINE_USE_AGGRESSIVE_LEVEL = 3
+ENGINE_CHASING_RULE = "skyrule_Jieqi"
+ENGINE_MULTIPV = 5  # Bắt buộc bằng 5 để có đủ nhánh phân tích lật mặt quân
 MIN_MOVE_SECONDS = 3.0
 MOVE_DEADLINE_SECONDS = 30.0
 MAX_SAFE_MOVES = 250
-TRUST_ENGINE_AFTER = 100
 MAX_ENGINE_RESTARTS_PER_GAME = 2
 MOVE_DEDUP_WINDOW = 0.1
-# AB-JChess dùng NNUE nên nghĩ lâu hơn có lợi; đặt movetime default 3000ms
-# (PikaJieQi cũ dùng 2000ms với classical eval)
 DEFAULT_MOVETIME_MS = 3000
 
 KICK_MODE = "never"
-KICK_DELAY = 5.0
 SIT_ALONE_TIMEOUT = 300.0
-
 BOT_BET_XU = 5000
 BOT_USE_CREATE_TABLE = True
 BOT_MATCH_DURATION = '5'
@@ -429,97 +304,12 @@ BOT_TURN_DURATION = '30'
 BOT_ACC_DURATION = '0'
 BOT_BLOCK_SOFTWARE = '0'
 
-VN_TEN_DAU = [
-    "Tuấn ",  "Minh ",  "Đức ",  "Hoàng ",  "Huy ",  "Hùng ",  "Dũng ",  "Cường ",  "Long ",  "Nam ",
-    "Sơn ",  "Hải ",  "Phong ",  "Thắng ",  "Trung ",  "Kiên ",  "Quân ",  "Thanh ",  "Đạt ",  "Khoa ",
-]
-VN_TEN_KHONG_DAU = [
-    "Tuan ",  "Minh ",  "Duc ",  "Hoang ",  "Huy ",  "Hung ",  "Dung ",  "Cuong ",  "Long ",  "Nam ",
-    "Son ",  "Hai ",  "Phong ",  "Thang ",  "Trung ",  "Kien ",  "Quan ",  "Thanh ",  "Dat ",  "Khoa ",
-]
-
-_IDENTITY_SYNCED = False
-
-def generate_dotted_full_name():
-    name = random.choice(VN_TEN_DAU if random.choice([True, False]) else VN_TEN_KHONG_DAU)
-    if len(name) >= 2:
-        pos = random.randint(1, len(name) - 1)
-        name = name[:pos] + "." + name[pos:]
-    return name
-
-def sync_profile_name(session):
-    try:
-        edit_url = "https://gamevh.net/com/ftl/game/profile/update_profile.jsp"
-        page = session.get(edit_url, timeout=15, allow_redirects=True)
-        form_match = re.search(r'(?is)<form\b[^>]*name=["\']InputForm0["\'][^>]*>.*?</form\s*>', page.text)
-        if not form_match: return
-        form = form_match.group(0)
-        open_tag = re.search(r'(?is)<form\b[^>]*>', form).group(0)
-        action_match = re.search(r'action=["\']([^"\']+)["\']', open_tag)
-        action = action_match.group(1) if action_match else edit_url
-        if not action.startswith('http'):
-            from urllib.parse import urljoin
-            action = urljoin(edit_url, action)
-        data = {}
-        for tag in re.findall(r'(?is)<input\b[^>]*>', form):
-            nm = re.search(r'name=["\']([^"\']+)["\']', tag)
-            val = re.search(r'value=["\']([^"\']*)["\']', tag)
-            if nm:
-                k = nm.group(1)
-                data[k] = val.group(1) if val else ''
-        old_full_name = data.get('FULL_NAME', '')
-        new_full_name = generate_dotted_full_name()
-        data['FULL_NAME'] = new_full_name
-        data['OLD_PASSWORD'] = PASSWD
-        data['SAVE'] = '\uf046'
-        session.post(action, timeout=15, data=data,
-                     headers={'Origin': 'https://gamevh.net',
-                              'Referer': page.url,
-                              'Content-Type': 'application/x-www-form-urlencoded'},
-                     allow_redirects=True)
-        print(f"[PROFILE] 👤 '{old_full_name}' -> '{new_full_name}'")
-    except Exception as e:
-        print(f"[PROFILE] Lỗi: {e}")
-
-def sync_random_avatar(session):
-    try:
-        profile_url = "https://gamevh.net/com/ftl/game/profile/player_profile.jsp"
-        before = session.get(profile_url, timeout=15)
-        m = re.search(r'/avatar/builtin(\d+).(?:webp|png|jpg)', before.text, re.I)
-        old_avatar = int(m.group(1)) if m else None
-        catalog = []
-        seen = set()
-        pattern = re.compile(
-            r'''buyAvatar\(\s*(["']?)(\d+)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["']?)([\d,.]+)\5\s*\)''',
-            re.I | re.S)
-        for category in range(1, 7):
-            url = f"https://gamevh.net/com/ftl/game/profile/avatar_by_category.jsp?excludeLayout=true&category_id={category}"
-            page = session.get(url, timeout=15)
-            for match in pattern.finditer(page.text):
-                avatar_id = int(match.group(2))
-                if avatar_id not in seen:
-                    seen.add(avatar_id)
-                    catalog.append(avatar_id)
-        choices = [a for a in catalog if a != old_avatar]
-        if not choices: return
-        selected = random.choice(choices)
-        update_url = f"https://gamevh.net/com/ftl/game/profile/update_avatar.jsp?pk={selected}&redirect=/"
-        session.post(update_url, timeout=20,
-                     headers={"Origin": "https://gamevh.net",
-                              "Referer": "https://gamevh.net/com/ftl/game/profile/avatar.jsp"},
-                     allow_redirects=True)
-    except Exception as e:
-        print(f"[PROFILE] Lỗi avatar: {e}")
+_IDENTITY_SYNCED = True  
 
 def fetch_session_info():
-    global COOKIE, TOKEN, CURRENT_PLAYER_NICKNAME, CURRENT_PLAYER_ID, PLACE_PATH, _IDENTITY_SYNCED
+    global COOKIE, TOKEN, CURRENT_PLAYER_NICKNAME, CURRENT_PLAYER_ID, PLACE_PATH
     try:
         session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/139.0 Safari/537.36",
-            "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.7",
-        })
         session.get(LOGIN_URL, timeout=20)
         session.post(
             LOGIN_URL, timeout=20,
@@ -529,16 +319,11 @@ def fetch_session_info():
                      "Referer": LOGIN_URL,
                      "Content-Type": "application/x-www-form-urlencoded"},
             allow_redirects=True)
-        if not _IDENTITY_SYNCED:
-            _IDENTITY_SYNCED = True
-            sync_profile_name(session)
-            sync_random_avatar(session)
         game_resp = session.get(GAME_URL, timeout=20)
         page_html = game_resp.text
         tm = re.search(r"var\s+token\s*=\s*(-?\d+)", page_html)
         if not tm: return False
         TOKEN = int(tm.group(1))
-        # FIX: Dùng raw string với dấu nháy đơn để tránh lỗi cú pháp
         nm = re.search(r'var\s+currentPlayerNickName\s*=\s*["\']([^"\']+)["\']', page_html)
         if not nm: return False
         CURRENT_PLAYER_NICKNAME = nm.group(1).strip()
@@ -551,23 +336,11 @@ def fetch_session_info():
             COOKIE = "; ".join(cookie_parts)
         except Exception:
             COOKIE = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
-        print(f"[SESSION] Login OK | Token: {TOKEN} | Nick: {CURRENT_PLAYER_NICKNAME} | ID: {CURRENT_PLAYER_ID}")
+        print(f"[SESSION] Login OK | Token: {TOKEN} | Nick: {CURRENT_PLAYER_NICKNAME}")
         return True
     except Exception as e:
         print(f"[SESSION] Lỗi: {e}")
         return False
-
-CMD_NAMES = {
-    300: "PONG", 301: "PING", 302: "LOGIN", 303: "ALERT",
-    311: "BROADCAST", 314: "SET_CLIENT_MODE", 315: "CONFIG",
-    331: "CHAT.SEND", 335: "CHAT.MSG",
-    401: "ENTER_PLACE", 405: "CREATE_RULE", 406: "PLAYER_ENTERED", 407: "PLAYER_EXITED",
-    408: "QUICK_PLAY", 410: "KICK_PLAYER", 412: "LIST_ZONE_ROOM", 413: "LIST_BET_AMT",
-    414: "GET_TABLE_DATA", 416: "SLOT_IN_TABLE_CHANGED",
-    417: "START_MATCH", 418: "GAMEOVER", 419: "ENTER_STATE",
-    420: "SET_TURN", 434: "SET_READY",
-    502: "PLAY", 529: "MOVE", 533: "ASK_DRAW", 534: "SURRENDER", 601: "LOGIN_EX",
-}
 
 class Conn:
     def pack(self, cmd, data=b''):
@@ -667,7 +440,6 @@ class XiangqiBoardTracker:
         self.is_red = None
         self.dark_positions = set()
         self.flip = False
-        self.flip_known = False
         self.side_to_move = 'w'
 
     def pos_to_rc(self, pos):
@@ -694,8 +466,7 @@ class XiangqiBoardTracker:
     def bag_string(self):
         bag = dict(INITIAL_BAG)
         for ch in self.revealed_chars:
-            if ch in bag:
-                bag[ch] = max(0, bag[ch] - 1)
+            if ch in bag: bag[ch] = max(0, bag[ch] - 1)
         return "".join(f"{k}{bag[k]}" for k in BAG_ORDER)
 
     def get_current_fen(self):
@@ -730,13 +501,10 @@ class XiangqiBoardTracker:
         red_rows, black_rows = [], []
         red_king_row = black_king_row = None
         for sid, face, position, is_open in pieces:
-            if position is None or position < 0 or position >= 90:
-                continue
+            if position is None or position < 0 or position >= 90: continue
             row = position // 9
             color = face[0] if face else (sid[0] if sid else 'r')
             ptype = int(face[1]) if len(face) > 1 and str(face[1]).isdigit() else 0
-            if ptype == 0 and len(sid) > 1 and str(sid[1]).isdigit():
-                ptype = int(sid[1])
             if color == 'r':
                 red_rows.append(row)
                 if ptype == 1: red_king_row = row
@@ -745,112 +513,47 @@ class XiangqiBoardTracker:
                 if ptype == 1: black_king_row = row
         if red_king_row is not None and black_king_row is not None:
             self.flip = red_king_row < black_king_row
-            self.flip_known = True
-        elif red_king_row is not None:
-            self.flip = red_king_row <= 4
-            self.flip_known = True
-        elif black_king_row is not None:
-            self.flip = black_king_row >= 5
-            self.flip_known = True
         elif red_rows and black_rows:
             self.flip = (sum(red_rows) / len(red_rows)) < (sum(black_rows) / len(black_rows))
-            self.flip_known = True
         else:
             self.flip = bool(self.is_red)
-            self.flip_known = False
         return self.flip
 
     def sanity_check_fen(self, board_fen):
         rows = board_fen.split(' ')[0].split('/')
-        if len(rows) != 10:
-            return False, f"FEN có {len(rows)} hàng"
+        if len(rows) != 10: return False, f"FEN có {len(rows)} hàng"
         K_row = k_row = None
         for i, r in enumerate(rows):
             if 'K' in r: K_row = i
             if 'k' in r: k_row = i
-        if K_row is None or k_row is None:
-            return False, "thiếu tướng"
-        if K_row < 7 or k_row > 2:
-            return False, f"tướng sai chiều (K hàng {K_row}, k hàng {k_row})"
+        if K_row is None or k_row is None: return False, "thiếu tướng"
+        if K_row < 7 or k_row > 2: return False, "tướng sai chiều"
         return True, "ok"
 
 class VisibleBoard:
-    """Tracks actual piece positions for 'see-all' mode.
-    
-    Maintains a 90-cell board with actual piece types (from raw_face).
-    Used to generate standard xiangqi FEN for the engine.
-    """
     TYPE_TO_FEN = {1: 'k', 2: 'a', 3: 'b', 4: 'r', 5: 'c', 6: 'n', 7: 'p'}
     
     def __init__(self):
-        self.cells = ['.'] * 90  # 90 positions, '.' = empty
-        self.side_to_move = 'w'
-        
-    def reset(self):
         self.cells = ['.'] * 90
-        self.side_to_move = 'w'
-    
+        
     def set_from_pieces(self, pieces, flip):
-        """Set board from START_MATCH pieces list.
-        pieces: [(sid, face, position, is_open), ...]
-        flip: board flip state (from XiangqiBoardTracker)
-        """
         self.cells = ['.'] * 90
         for sid, face, position, is_open in pieces:
-            if position < 0 or position >= 90:
-                continue
+            if position < 0 or position >= 90: continue
             if len(face) >= 2:
-                color = face[0]  # 'r' or 'b'
+                color = face[0]
                 piece_type = int(face[1])
                 fen_char = self.TYPE_TO_FEN.get(piece_type, '?')
-                if color == 'r':
-                    fen_char = fen_char.upper()
+                if color == 'r': fen_char = fen_char.upper()
                 self.cells[position] = fen_char
     
     def apply_move(self, source_pos, target_pos):
-        """Move a piece from source to target."""
         if 0 <= source_pos < 90 and 0 <= target_pos < 90:
-            self.cells[target_pos] = self.cells[source_pos]
-            self.cells[source_pos] = '.'
-    
-    def flip_side(self):
-        self.side_to_move = 'b' if self.side_to_move == 'w' else 'w'
-    
-    def to_fen(self, flip=False):
-        """Convert to FEN string.
-        Server positions: pos = row * 9 + col (row 0 = RED bottom, row 9 = BLACK top)
-        FEN format: row 9 first (top), row 0 last (bottom)
-        """
-        rows = []
-        for board_row in range(9, -1, -1):  # row 9 → row 0
-            fen_str = ""
-            empty = 0
-            for col in range(9):
-                pos = board_row * 9 + col
-                piece = self.cells[pos] if 0 <= pos < 90 else '.'
-                if piece == '.':
-                    empty += 1
-                else:
-                    if empty > 0:
-                        fen_str += str(empty)
-                        empty = 0
-                    fen_str += piece
-            if empty > 0:
-                fen_str += str(empty)
-            rows.append(fen_str)
-        return '/'.join(rows) + ' ' + self.side_to_move + ' - - 0 1'
-
+            if source_pos != target_pos:
+                self.cells[target_pos] = self.cells[source_pos]
+                self.cells[source_pos] = '.'
 
 class FlipchessAbjchessEngine:
-    """AB-JChess 0.2d engine wrapper, UCI protocol, Pikafish-derived Jieqi NNUE.
-
-    Khác biệt so với FlipchessJieqiEngine (PikaJieQi):
-    - NNUE là BẮT BUỘC (phải load được EvalFile trước khi isready)
-    - Binary tên 'AB-JChess' (Linux build) hoặc 'AB-JChess.exe' (Windows)
-    - setoption thêm: AggressiveLevel, ChasingRule (riêng của AB-JChess)
-    - Còn lại UCI tương thích ngược với PikaJieQi (FEN BAG, reveal suffix)
-    """
-
     def __init__(self):
         self.proc = None
         self.binary_path = None
@@ -864,45 +567,27 @@ class FlipchessAbjchessEngine:
         self._restart_count = 0
         self._stdout_lines = []
         self._lines_lock = threading.Lock()
+        self.multipv_info = {}  # Lưu dictionary {move: cp_score} của các pv tốt nhất
+
         for path in ABJCHESS_BINARY_CANDIDATES:
             if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                self.binary_path = path
-                break
+                self.binary_path = path; break
         if not self.binary_path:
-            print(f"[ENGINE] ❌ Không tìm thấy AB-JChess binary. Đã thử: {ABJCHESS_BINARY_CANDIDATES}")
-            print(f"[ENGINE] ❌ Build từ source: cd AB-JChess/abjchess && make -j2 build ARCH=x86-64-bmi2 COMP=gcc")
-            print(f"[ENGINE] ❌ Hoặc download Windows build: https://github.com/lxsgx23/AB-JChess/releases/tag/v0.2d")
-            self.engine = False
-            return
-        # ★ Tìm file NNUE — BẮT BUỘC cho AB-JChess (khác PikaJieQi)
+            self.engine = False; return
+            
         for path in ABJCHESS_NNUE_CANDIDATES:
             if path and os.path.isfile(path):
-                self.nnue_path = path
-                break
+                self.nnue_path = path; break
         if not self.nnue_path:
-            print(f"[ENGINE] ❌ Không tìm thấy file NNUE abjchess-*.nnue.")
-            print(f"[ENGINE] ❌ Download từ https://github.com/lxsgx23/AB-JChess/releases/tag/v0.2d (0.2d_bmi2.zip)")
-            print(f"[ENGINE] ❌ Hoặc override qua env MISTBOARD_ABJCHESS_NNUE=/path/to/abjchess-*.nnue")
-            self.engine = False
-            return
-        print(f"[ENGINE] 🎯 AB-JChess 0.2d (flipchess) = {self.binary_path}")
-        print(f"[ENGINE] 🎯 NNUE = {self.nnue_path}")
+            self.engine = False; return
 
         self._init_engine()
         self.engine = self.proc is not None
 
     def _init_engine(self):
         if self.proc:
-            try:
-                self.proc.stdin.write("quit\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=2)
-            except Exception:
-                pass
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+            try: self.proc.kill()
+            except: pass
             self.proc = None
         try:
             self.proc = subprocess.Popen(
@@ -911,8 +596,7 @@ class FlipchessAbjchessEngine:
                 text=True, bufsize=1,
                 cwd=os.path.dirname(self.binary_path),
             )
-        except Exception as e:
-            print(f"[ENGINE] ❌ Popen error: {e}")
+        except Exception:
             return
 
         def consume_stderr(proc):
@@ -920,19 +604,13 @@ class FlipchessAbjchessEngine:
                 while proc.poll() is None:
                     line = proc.stderr.readline()
                     if not line: break
-                    line = line.strip()
-                    if line:
-                        print(f"[PKJQ-DBG] {line}")
-            except Exception:
-                pass
+            except: pass
         threading.Thread(target=consume_stderr, args=(self.proc,), daemon=True).start()
 
         def consume_stdout(proc):
             while True:
-                try:
-                    line = proc.stdout.readline()
-                except Exception:
-                    break
+                try: line = proc.stdout.readline()
+                except: break
                 if not line: break
                 line = line.strip()
                 if not line: continue
@@ -940,59 +618,57 @@ class FlipchessAbjchessEngine:
                     self._stdout_lines.append(line)
                     if len(self._stdout_lines) > 200:
                         self._stdout_lines = self._stdout_lines[-100:]
-                if line == "readyok":
-                    self._readyok = True
-                if line.startswith("info string"):
-                    print(f"[ENGINE-MSG] {line}", flush=True)
+                        
+                if line == "readyok": self._readyok = True
                 if line.startswith("bestmove"):
                     self._latest_bestmove = line
                     self._engine_searching = False
+                
+                # Parse MultiPV lines: info depth 12 multipv 1 score cp 320 pv c3c4 ...
+                if line.startswith("info") and " pv " in line:
+                    try:
+                        m_move = re.search(r' pv ([a-i]\d[a-i]\d)', line)
+                        m_score = re.search(r'score (cp|mate) (-?\d+)', line)
+                        if m_move and m_score:
+                            mv = m_move.group(1)
+                            stype = m_score.group(1)
+                            sval = int(m_score.group(2))
+                            if stype == "mate":
+                                sval = 90000 if sval > 0 else -90000
+                            self.multipv_info[mv] = sval
+                    except Exception:
+                        pass
+                        
         threading.Thread(target=consume_stdout, args=(self.proc,), daemon=True).start()
 
         with self.engine_lock:
             try:
                 self.proc.stdin.write("uci\n")
                 self.proc.stdin.flush()
-            except Exception as e:
-                print(f"[ENGINE] ❌ Send uci error: {e}")
-                return
-        if not self._wait_for_line("uciok", timeout=30):
-            print("[ENGINE] ❌ uciok timeout")
-            self._kill()
-            return
-        # ★ AB-JChess: NNUE BẮT BUỘC — phải gửi EvalFile trước isready.
-        # (PikaJieQi cũ chỉ gửi pikafish.nnue nếu file tồn tại; AB-JChess thì bắt buộc.)
+            except: return
+        if not self._wait_for_line("uciok", timeout=30): return
+
         with self.engine_lock:
             try:
                 _threads = max(1, min(2, (os.cpu_count() or 2) - 1))
                 self.proc.stdin.write(f"setoption name Threads value {_threads}\n")
                 self.proc.stdin.write("setoption name Hash value 128\n")
-                # ★ AB-JChess yêu cầu EvalFile — không có thì engine crash khi go.
                 self.proc.stdin.write(f"setoption name EvalFile value {self.nnue_path}\n")
-                self.proc.stdin.write("setoption name MultiPV value 1\n")
-                # ★ 2 option riêng của AB-JChess (giá trị mặc định theo README)
+                self.proc.stdin.write(f"setoption name MultiPV value {ENGINE_MULTIPV}\n")
                 self.proc.stdin.write(f"setoption name AggressiveLevel value {ENGINE_USE_AGGRESSIVE_LEVEL}\n")
                 self.proc.stdin.write(f"setoption name ChasingRule value {ENGINE_CHASING_RULE}\n")
                 self.proc.stdin.write("isready\n")
                 self.proc.stdin.flush()
-            except Exception as e:
-                print(f"[ENGINE] ❌ Config error: {e}")
-                return
-        if not self._wait_for_readyok(timeout=30):
-            print("[ENGINE] ❌ readyok timeout (có thể do NNUE sai version — kiểm tra abjchess-*.nnue)")
-            self._kill()
-            return
-        print("[ENGINE] ✅ AB-JChess 0.2d (flipchess) ready")
+            except: return
+        self._wait_for_readyok(timeout=30)
 
     def _wait_for_line(self, prefix, timeout=10):
         t0 = time.time()
         while time.time() - t0 < timeout:
-            if self.proc and self.proc.poll() is not None:
-                return False
+            if self.proc and self.proc.poll() is not None: return False
             with self._lines_lock:
                 for l in self._stdout_lines:
-                    if l.startswith(prefix) or l == prefix:
-                        return True
+                    if l.startswith(prefix) or l == prefix: return True
             time.sleep(0.05)
         return False
 
@@ -1004,67 +680,46 @@ class FlipchessAbjchessEngine:
             time.sleep(0.05)
         return False
 
-    def _kill(self):
-        if self.proc:
-            try: self.proc.kill()
-            except: pass
-            self.proc = None
-
-    def alive(self):
-        return self.proc is not None and self.proc.poll() is None
+    def alive(self): return self.proc is not None and self.proc.poll() is None
 
     def restart(self):
-        if self._restart_count >= MAX_ENGINE_RESTARTS_PER_GAME:
-            print(f"[ENGINE] ❌ Quá {MAX_ENGINE_RESTARTS_PER_GAME} restarts")
-            return False
+        if self._restart_count >= MAX_ENGINE_RESTARTS_PER_GAME: return False
         self._restart_count += 1
-        print(f"[ENGINE] 🔄 Restart (#{self._restart_count})")
         self._init_engine()
         return self.alive()
 
     def get_best_move(self, fen, moves, movetime_ms=DEFAULT_MOVETIME_MS, searchmoves=None):
         if not self.alive():
-            if not self.restart():
-                return None
+            if not self.restart(): return None
         self._latest_bestmove = None
         self._engine_searching = True
+        self.multipv_info.clear()  # Reset maphack list
+        
         with self._lines_lock:
             self._stdout_lines.clear()
         try:
-            # ★ Use "position startpos moves ..." — AB-JChess native format
-            # (Tương thích ngược với PikaJieQi: cùng FEN BAG, cùng reveal suffix)
-            # AB-JChess auto-tracks BAG and dark piece reveals from move suffixes
-            # BAG updates correctly: c3c4N → N2→N1 in BAG
-            # Engine uses BAG for expected value calculation in flip_search
             cmd = "position startpos"
-            if moves:
-                cmd += " moves " + " ".join(moves)
-            # ★ go infinite [searchmoves ...] — restrict search space if provided
-            # Used for opening strategy (3 nước đầu chỉ chọn xe/pháo)
+            if moves: cmd += " moves " + " ".join(moves)
             go_cmd = "go infinite"
             if searchmoves:
                 sm_clean = [m for m in searchmoves if m and len(m) >= 4][:128]
-                if sm_clean:
-                    go_cmd += " searchmoves " + " ".join(sm_clean)
+                if sm_clean: go_cmd += " searchmoves " + " ".join(sm_clean)
             with self.engine_lock:
                 self.proc.stdin.write(cmd + "\n")
                 self.proc.stdin.flush()
                 self.proc.stdin.write(go_cmd + "\n")
                 self.proc.stdin.flush()
-        except Exception as e:
-            print(f"[ENGINE] Send error: {e}")
-            self._engine_searching = False
-            return None
+        except: return None
+        
         time.sleep(movetime_ms / 1000.0)
         try:
             with self.engine_lock:
                 self.proc.stdin.write("stop\n")
                 self.proc.stdin.flush()
-        except Exception:
-            pass
+        except: pass
+        
         t0 = time.time()
-        timeout = 5.0
-        while time.time() - t0 < timeout:
+        while time.time() - t0 < 5.0:
             if self._latest_bestmove:
                 self._engine_searching = False
                 with self._lines_lock:
@@ -1074,21 +729,14 @@ class FlipchessAbjchessEngine:
                             if m: self._last_depth = m.group(1)
                             sm = re.search(r'score (cp|mate) (-?\d+)', l)
                             if sm:
-                                if sm.group(1) == "mate":
-                                    self._last_score = f"M{sm.group(2)}"
-                                else:
-                                    self._last_score = f"{int(sm.group(2))/100:+.2f}"
+                                if sm.group(1) == "mate": self._last_score = f"M{sm.group(2)}"
+                                else: self._last_score = f"{int(sm.group(2))/100:+.2f}"
                             break
                 return self._latest_bestmove
-            if not self.alive():
-                self._engine_searching = False
-                return None
+            if not self.alive(): return None
             time.sleep(0.02)
-        print(f"[ENGINE] bestmove timeout after stop")
-        self._engine_searching = False
         return self._latest_bestmove
 
-# Backward compat alias: code cũ tham chiếu FlipchessJieqiEngine vẫn chạy được
 FlipchessJieqiEngine = FlipchessAbjchessEngine
 
 
@@ -1106,12 +754,8 @@ class JieqiCupBot:
         self._last_quick_play_time = 0
         self._QUICK_PLAY_INTERVAL = 3.0
         self.ROOM_LIST = ["0", "1", "2", "3"]
-        _bot_num = re.search(r"\d+", USER)
-        _offset = int(_bot_num.group(0)) if _bot_num else 0
-        self._search_room_idx = _offset % len(self.ROOM_LIST)
         self._quick_play_attempts = 0
         self._sit_alone_since = None
-        self._table_created_by_me = False
         self.bet_amts = []
         self._resolved_bet_id = None
         self._bet_amts_loaded = False
@@ -1119,9 +763,6 @@ class JieqiCupBot:
         self.last_action_timestamp = time.time()
         self.last_recv_timestamp = time.time()
         self.slot_players = {}
-        self._pending_kick_id = None
-        self._table_path = None
-        self._table_path_ts = 0.0
         self._reconnect_streak = 0
         self._connected_since = 0.0
         self._closing = False
@@ -1139,51 +780,20 @@ class JieqiCupBot:
         self._move_lock = threading.Lock()
         self._last_move_uci = None
         self._last_move_time = 0.0
-        self._move_recv_count = 0
-        self._move_skip_count = 0
-        self._move_error_count = 0
         self._game_seq = 0
-        self._moves_len_at_turn_start = 0
-        self._bot_move_count = 0  # ★ Track bot's move count for opening strategy
-
         self.engine = FlipchessAbjchessEngine()
-        if not self.engine.engine:
-            print("[BOT] ❌ AB-JChess engine not ready — bot sẽ không nghĩ được")
-        else:
-            print("[BOT] ✅ AB-JChess 0.2d ready")
 
-    # =====================================================================
-    # WS LIFECYCLE — FIX MẤT KẾT NỐI WEBSOCKET
-    # 3 nguyên nhân khiến bot "mất kết nối" trước đây:
-    #  1) Thread/callback của ws CŨ còn sống sau khi đã mở ws MỚI -> on_close
-    #     của ws cũ set connected=False làm rớt ws mới ngay lập tức.
-    #  2) Socket chết lặng (không FIN, không pong) -> on_close không bao giờ
-#     gọi tới -> run() kẹt ở nhánh "vẫn connected", không bao giờ reconnect.
-    #  3) Mỗi lần reconnect lại spawn thêm 1 thread keep-alive + 1 thread
-    #     run_forever mới (rò rỉ, nhiều thread PING song song).
-    # =====================================================================
     def _is_stale(self, ws):
-        """Callback đến từ WebSocketApp ĐÃ BỊ THAY THẾ -> phải bỏ qua."""
         return ws is not None and self.ws is not None and ws is not self.ws
 
     def _disconnect(self, reason=""):
-        """Chủ động đóng ws hiện tại và ép connected=False.
-
-        Không phụ thuộc on_close: kể cả khi socket chết lặng (on_close không
-        được gọi), run() vẫn thấy connected=False và reconnect ngay.
-        """
-        if self._closing:
-            return
+        if self._closing: return
         self._closing = True
         try:
-            if reason:
-                print(f"[WS] 🔌 Ngắt kết nối: {reason}", flush=True)
-            ws = self.ws
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+            if reason: print(f"[WS] 🔌 {reason}")
+            if self.ws:
+                try: self.ws.close()
+                except: pass
             self.connected = False
             self.logged_in = False
         finally:
@@ -1191,17 +801,11 @@ class JieqiCupBot:
 
     def connect(self):
         import websocket
-        old_ws = self.ws
-        if old_ws is not None:
-            try:
-                old_ws.close()
-            except Exception:
-                pass
-        old_thread = getattr(self, "ws_thread", None)
-        if old_thread is not None and old_thread.is_alive():
-            # Đợi thread ws cũ thoát hẳn — tránh 2 thread run_forever cùng
-            # chạy: thread cũ đóng sau sẽ set connected=False làm rớt ws mới.
-            old_thread.join(timeout=5)
+        if self.ws:
+            try: self.ws.close()
+            except: pass
+        if getattr(self, "ws_thread", None) and self.ws_thread.is_alive():
+            self.ws_thread.join(timeout=5)
         self.connected = False
         app = websocket.WebSocketApp(
             WS_URL, cookie=COOKIE,
@@ -1214,21 +818,16 @@ class JieqiCupBot:
             target=lambda: app.run_forever(ping_interval=20, ping_timeout=None),
             daemon=True)
         self.ws_thread.start()
-        for _ in range(75):          # chờ tối đa 15s (bản cũ chỉ 5s)
-            if self.connected:
-                break
-            if not self.ws_thread.is_alive():
-                print("[WS] ❌ Thread thoát trước khi mở kết nối", flush=True)
-                break
+        for _ in range(75):
+            if self.connected: break
+            if not self.ws_thread.is_alive(): break
             time.sleep(0.2)
         return self.connected
 
     def _on_open(self, ws):
         if self._is_stale(ws):
-            try:
-                ws.close()
-            except Exception:
-                pass
+            try: ws.close()
+            except: pass
             return
         self.connected = True
         self.last_action_timestamp = time.time()
@@ -1237,65 +836,38 @@ class JieqiCupBot:
         self._send_login()
 
     def _on_ping(self, ws, message):
-        """Server ping -> kết nối còn sống; trả pong ngay (nếu lib chưa làm)."""
-        if self._is_stale(ws):
-            return
+        if self._is_stale(ws): return
         self.last_recv_timestamp = time.time()
-        try:
-            ws.pong(message)
-        except Exception:
-            pass
+        try: ws.pong(message)
+        except: pass
 
     def _on_pong(self, ws, message):
-        """Pong từ server (phản hồi ping của bot) -> kết nối thật sự còn sống."""
-        if self._is_stale(ws):
-            return
+        if self._is_stale(ws): return
         self.last_recv_timestamp = time.time()
 
     def _on_message(self, ws, message):
-        if self._is_stale(ws):
-            return
+        if self._is_stale(ws): return
         self.last_recv_timestamp = time.time()
         if isinstance(message, bytes):
-            # Decode once and make the parsed event available to handlers.
-            # This keeps the WS dump/parser and game state on the same input.
             self._decoded_ws_event = None
             try:
                 self._decoded_ws_event = decode_frame(message)
-                log_incoming_frame(message)
-            except Exception as exc:
-                print(f"[WS-CAPTURE] decode failed: {exc}", flush=True)
+            except: pass
             self._handle_binary_message(message)
 
     def _on_error(self, ws, error):
-        if self._is_stale(ws):
-            return
-        print(f"[WS] ❌ Error: {type(error).__name__}: {error}")
-        # Lỗi socket thường đi kèm kết nối đã hỏng -> đóng NGAY để run()
-        # reconnect, thay vì chờ hết 60-120s mới phát hiện.
-        self._disconnect(f"error: {type(error).__name__}: {error}")
+        if self._is_stale(ws): return
+        self._disconnect(f"error: {error}")
 
     def _on_close(self, ws, code, msg):
-        if self._is_stale(ws):
-            return                      # ws cũ đóng -> không phá state ws mới
-        if self.board.is_playing:
-            print(f"[WS] ⚠️ DISCONNECTED INGAME (code={code})")
-        else:
-            print(f"[WS] Closed (code={code})")
+        if self._is_stale(ws): return
         if self._connected_since and time.time() - self._connected_since < 60:
             self._reconnect_streak += 1
-        else:
-            self._reconnect_streak = 0
-        self.connected = False
-        self.logged_in = False
-        self.in_game = False
-        self._joining_table = False
-        self._bet_amts_loaded = False
-        self._resolved_bet_id = None
-        self.bet_amts = []
-        self.fixed_pawn_positions = set()
-        self._thinking = False
-        self._played_this_turn = False
+        else: self._reconnect_streak = 0
+        self.connected = False; self.logged_in = False; self.in_game = False
+        self._joining_table = False; self._bet_amts_loaded = False
+        self._resolved_bet_id = None; self.bet_amts = []
+        self._thinking = False; self._played_this_turn = False
         self.board.reset()
 
     def send_message(self, cmd, data=b''):
@@ -1303,11 +875,8 @@ class JieqiCupBot:
             try:
                 self.ws.send(self.conn.pack(cmd, data), opcode=0x2)
                 return True
-            except Exception as e:
-                # Socket đã chết mà vẫn im lặng: nếu nuốt lỗi như bản cũ thì
-                # bot "nghĩ" là còn kết nối và treo tới tận 60-120s mới reconnect.
-                print(f"[WS] send '{cmd}' lỗi: {type(e).__name__}: {e}", flush=True)
-                self._disconnect(f"send {cmd} fail")
+            except:
+                self._disconnect(f"send fail")
         return False
 
     def _send_login(self):
@@ -1330,27 +899,10 @@ class JieqiCupBot:
     def send_list_bet_amt(self):
         self.send_message("LIST_BET_AMT")
 
-    def get_1k_to_5k_bet_objs(self):
-        if not self.bet_amts: return []
-        valid = [ba for ba in self.bet_amts if 1000 <= ba["value"] <= 5000]
-        if valid:
-            random.shuffle(valid)
-            return valid
-        return [self.bet_amts[0]] if self.bet_amts else []
-
     def leave_table(self):
-        if self.board.is_playing:
-            print("[TABLE] ⚠️ Ingame, cannot leave!")
-            return
-        print("[TABLE] 🚪 Leaving...")
-        self.in_game = False
-        self._joining_table = False
-        self._table_path = None
-        self._table_created_by_me = False
-        self._sit_alone_since = None
-        self.slot_players.clear()
-        self.board.reset()
-        self._quick_play_attempts = 0
+        if self.board.is_playing: return
+        self.in_game = False; self._joining_table = False
+        self.slot_players.clear(); self.board.reset()
         self._enter_fail_at = 0.0
         self.send_enter_place(PLACE_PATH)
 
@@ -1364,36 +916,20 @@ class JieqiCupBot:
 
     def send_create_table(self, bet_amt_id=None):
         now = time.time()
-        if now - self._last_quick_play_time < self._QUICK_PLAY_INTERVAL:
-            return
+        if now - self._last_quick_play_time < self._QUICK_PLAY_INTERVAL: return
         self._last_quick_play_time = now
         if bet_amt_id is None:
-            bet_amt_id = self._resolved_bet_id if self._resolved_bet_id is not None else self.resolve_bet_amt_id()
-        if bet_amt_id is None:
-            return
-        args = [
-            ("matchDuration", str(BOT_MATCH_DURATION)),
-            ("turnDuration", str(BOT_TURN_DURATION)),
-            ("accDuration", str(BOT_ACC_DURATION)),
-            ("blockSoftware", str(BOT_BLOCK_SOFTWARE)),
-        ]
+            bet_amt_id = self._resolved_bet_id if self._resolved_bet_id else self.resolve_bet_amt_id()
+        if bet_amt_id is None: return
+        args = [("matchDuration", str(BOT_MATCH_DURATION)), ("turnDuration", str(BOT_TURN_DURATION)),
+                ("accDuration", str(BOT_ACC_DURATION)), ("blockSoftware", str(BOT_BLOCK_SOFTWARE))]
         data = bytearray()
         data.extend(self.conn.pack_byte(bet_amt_id))
         data.extend(self.conn.pack_byte(len(args)))
-        for arg_name, arg_value in args:
-            data.extend(self.conn.pack_ascii(arg_name))
-            data.extend(self.conn.pack_string(arg_value))
+        for k, v in args:
+            data.extend(self.conn.pack_ascii(k))
+            data.extend(self.conn.pack_string(v))
         self.send_message("CREATE_RULE", bytes(data))
-
-    def send_quick_play(self, room_id="", bet_amt_id=-1):
-        now = time.time()
-        if now - self._last_quick_play_time < self._QUICK_PLAY_INTERVAL:
-            return
-        self._last_quick_play_time = now
-        data = bytearray()
-        data.extend(self.conn.pack_ascii(room_id))
-        data.extend(self.conn.pack_byte(bet_amt_id))
-        self.send_message("QUICK_PLAY", bytes(data))
 
     def send_play(self, source_pos, target_pos):
         self._played_this_turn = True
@@ -1404,93 +940,45 @@ class JieqiCupBot:
 
     def opponent_player_id(self):
         for sid, pid in self.slot_players.items():
-            if pid and pid != CURRENT_PLAYER_ID and sid != self.board.my_slot_id:
-                return pid
+            if pid and pid != CURRENT_PLAYER_ID and sid != self.board.my_slot_id: return pid
         return None
-
-    def send_kick_player(self, player_id):
-        self._pending_kick_id = player_id
-        data = bytearray()
-        data.extend(struct.pack('>q', int(player_id)))
-        print(f"[KICK] Sending playerId={player_id}")
-        self.send_message(410, bytes(data))
 
     def send_ready(self, is_ready=1):
         if self.board.is_playing: return
-        print("[GAME] ⏳ READY")
         data = bytearray()
         data.extend(self.conn.pack_byte(is_ready))
         self.send_message("SET_READY", bytes(data))
 
     def _handle_binary_message(self, data):
-        cmd_for_log = "?"
         try:
             msg = InboundMessage(data)
             cmd = msg.command
-            cmd_for_log = cmd
-            if cmd == "PING":
-                self.send_message("PONG")
-            elif cmd == "LOGIN":
-                self._handle_login_response(msg)
-            elif cmd == "ENTER_PLACE":
-                self._handle_enter_place_response(msg)
-            elif cmd == "QUICK_PLAY":
-                self._handle_quick_play_response(msg)
-            elif cmd == "LIST_BET_AMT":
-                self._handle_list_bet_amt_response(msg)
-            elif cmd == "CREATE_RULE":
-                self._handle_create_rule_response(msg)
-            elif cmd == "SLOT_IN_TABLE_CHANGED":
-                self._handle_slot_changed(msg)
-            elif cmd == "PLAYER_ENTERED":
-                self._handle_player_entered(msg)
-            elif cmd == "START_MATCH":
-                self._handle_start_match(msg)
-            elif cmd == "MOVE":
-                self._handle_move(msg)
-            elif cmd == "PLAY" or cmd == "502":
-                self._handle_play_response(msg)
-            elif cmd == "SET_TURN":
-                self._handle_set_turn(msg)
-            elif cmd == "GAMEOVER":
-                self._handle_gameover(msg)
-            elif cmd == "KICK_PLAYER":
-                self._handle_kick_response(msg)
-            elif cmd == "ALERT":
-                try:
-                    print(f"[SERVER] ALERT: {msg.read_string()}")
-                except Exception:
-                    pass
+            if cmd == "PING": self.send_message("PONG")
+            elif cmd == "LOGIN": self._handle_login_response(msg)
+            elif cmd == "ENTER_PLACE": self._handle_enter_place_response(msg)
+            elif cmd == "QUICK_PLAY" or cmd == "CREATE_RULE": self._handle_join_success(msg)
+            elif cmd == "LIST_BET_AMT": self._handle_list_bet_amt_response(msg)
+            elif cmd == "SLOT_IN_TABLE_CHANGED": self._handle_slot_changed(msg)
+            elif cmd == "PLAYER_ENTERED": self._handle_player_entered(msg)
+            elif cmd == "START_MATCH": self._handle_start_match(msg)
+            elif cmd == "MOVE": self._handle_move(msg)
+            elif cmd == "PLAY" or cmd == "502": self._handle_play_response(msg)
+            elif cmd == "SET_TURN": self._handle_set_turn(msg)
+            elif cmd == "GAMEOVER": self._handle_gameover(msg)
+            elif cmd == "KICK_PLAYER": self._handle_kick_response(msg)
         except Exception as e:
-            print(f"[RECV ERROR] cmd={cmd_for_log} err={e}", flush=True)
-            traceback.print_exc()
+            pass
 
     def _handle_login_response(self, msg):
         status = msg.read_byte()
         if status == 0:
-            self._login_retry_count = 0
             self.logged_in = True
             path = msg.read_string()
             if path == 'REFRESH':
-                if fetch_session_info():
-                    self._send_login()
-                else:
-                    self._disconnect("session REFRESH failed")
+                if fetch_session_info(): self._send_login()
+                else: self._disconnect("session REFRESH failed")
                 return
             self.send_enter_place()
-            return
-        # Server từ chối login (token hết hạn / phiên sai...). Bản cũ im lặng
-        # hoàn toàn -> bot treo mãi ở trạng thái "connected nhưng chưa login".
-        print(f"[LOGIN] ❌ status={status} -> làm lại session", flush=True)
-        self._login_retry_count += 1
-        if self._login_retry_count <= 3:
-            def _retry_login():
-                time.sleep(2.0)
-                if fetch_session_info():
-                    self._send_login()
-                else:
-                    self._disconnect("login retry failed")
-            threading.Thread(target=_retry_login, daemon=True).start()
         else:
             self._disconnect(f"login failed status={status}")
 
@@ -1498,50 +986,23 @@ class JieqiCupBot:
         status = msg.read_byte()
         if status != 0:
             if self._joining_table:
-                print(f"[TABLE] ENTER_PLACE status={status}")
-                self._joining_table = False
-                self.in_game = True
-                self._enter_fail_at = time.time()
-                threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)),
-                                 daemon=True).start()
+                self._joining_table = False; self.in_game = True
+                threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
             return
         if self._joining_table:
-            self._joining_table = False
-            self.in_game = True
-            self._enter_fail_at = 0.0
-            self.last_action_timestamp = time.time()
-            threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)),
-                             daemon=True).start()
+            self._joining_table = False; self.in_game = True
+            threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
         elif not self.in_game:
-            if self._table_path and time.time() - self._table_path_ts < 180:
-                print(f"[TABLE] Rejoin: {self._table_path}")
-                self.in_game = True
-                self._joining_table = True
-                path = self._table_path
-                threading.Thread(target=lambda: (time.sleep(0.5),
-                                                  self.send_enter_place(path=path, mode=1)),
-                                 daemon=True).start()
-                return
-            self._bet_amts_loaded = False
-            self._resolved_bet_id = None
             self.send_list_bet_amt()
 
-    def _handle_quick_play_response(self, msg):
+    def _handle_join_success(self, msg):
         status = msg.read_byte()
         if status == 0:
             table_path = msg.read_ascii()
-            self.in_game = True
-            self._joining_table = True
-            self._table_created_by_me = False
+            self.in_game = True; self._joining_table = True
             self._sit_alone_since = time.time()
-            self._table_path = table_path
-            self._table_path_ts = time.time()
-            print(f"[SEARCH] ✅ Table: {table_path}")
-            threading.Thread(target=lambda: (time.sleep(0.5),
-                                              self.send_enter_place(path=table_path, mode=1)),
-                             daemon=True).start()
-        else:
-            self._joining_table = False
+            threading.Thread(target=lambda: (time.sleep(0.5), self.send_enter_place(path=table_path, mode=1)), daemon=True).start()
+        else: self._joining_table = False
 
     def _handle_list_bet_amt_response(self, msg):
         if msg.read_byte() != 0: return
@@ -1550,184 +1011,96 @@ class JieqiCupBot:
         self._resolved_bet_id = self.resolve_bet_amt_id()
         self._bet_amts_loaded = True
 
-    def _handle_create_rule_response(self, msg):
-        status = msg.read_byte()
-        if status == 0:
-            table_path = msg.read_ascii()
-            self.in_game = True
-            self._joining_table = True
-            self._table_created_by_me = True
-            self._sit_alone_since = time.time()
-            self._table_path = table_path
-            self._table_path_ts = time.time()
-            print(f"[CREATE] 🎉 {table_path}")
-            threading.Thread(target=lambda: (time.sleep(0.5),
-                                              self.send_enter_place(path=table_path, mode=1)),
-                             daemon=True).start()
-        else:
-            print(f"[CREATE] ❌ status={status}")
-            self._joining_table = False
-
     def _handle_player_entered(self, msg):
         try:
-            _ = msg.read_byte()
-            pid = msg.read_long()
-            name = msg.read_string()
-            if pid > 0 and pid != CURRENT_PLAYER_ID:
-                self.player_names[pid] = name
-                print(f"[PLAYER] 👤 '{name}' (id={pid})")
-        except Exception:
-            pass
+            msg.read_byte(); pid = msg.read_long(); name = msg.read_string()
+            if pid > 0 and pid != CURRENT_PLAYER_ID: self.player_names[pid] = name
+        except: pass
 
     def _handle_slot_changed(self, msg):
         try:
-            _ = msg.read_string()
-            slot_id = msg.read_byte()
+            msg.read_string(); slot_id = msg.read_byte()
             msg.read_long(); msg.read_long(); msg.read_byte(); msg.read_short()
             msg.read_ascii(); msg.read_byte(); msg.read_byte()
             player_id = msg.read_long()
-            if player_id > 0:
-                self.slot_players[slot_id] = player_id
-            else:
-                self.slot_players.pop(slot_id, None)
-            if player_id == CURRENT_PLAYER_ID:
-                self.board.my_slot_id = slot_id
+            if player_id > 0: self.slot_players[slot_id] = player_id
+            else: self.slot_players.pop(slot_id, None)
+            
+            if player_id == CURRENT_PLAYER_ID: self.board.my_slot_id = slot_id
             else:
                 if player_id > 0:
-                    name = self.player_names.get(player_id, "")
-                    print(f"[TABLE] Opponent: pid={player_id}{f', {name}' if name else ''}")
                     self._sit_alone_since = None
                     if not self.board.is_playing:
-                        threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)),
-                                         daemon=True).start()
+                        threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
                 else:
                     if not self.board.is_playing and self.opponent_player_id() is None:
-                        print(f"[TABLE] No opponent, waiting {int(SIT_ALONE_TIMEOUT)}s...")
                         self._sit_alone_since = time.time()
-        except Exception:
-            pass
+        except: pass
 
     def _handle_start_match(self, msg):
         self._game_seq += 1
         print(f"[GAME] 🎮 Match #{self._game_seq}")
-        if self.engine and hasattr(self.engine, "_restart_count"):
-            self.engine._restart_count = 0
-        self._bot_move_count = 0  # ★ Reset bot move count cho ván mới
-        self._thinking = False
-        self._played_this_turn = False
-        self._turn_started_at = 0.0
-        self._turn_deadline = 0.0
-        self._play_reject_count = 0
-        self._rejected_moves = set()
-        self._last_sent_move = None
-        self._reconnect_streak = 0
-        self._enter_fail_at = 0.0
-        self._sit_alone_since = None
-        self._move_recv_count = 0
-        self._move_skip_count = 0
-        self._move_error_count = 0
-        self._last_move_uci = None
-        self._last_move_time = 0.0
-        self.board.reset()
-        self.fixed_pawn_positions.clear()
-        self.board.is_playing = True
-        self.in_game = True
+        self._thinking = False; self._played_this_turn = False
+        self._play_reject_count = 0; self._rejected_moves = set()
+        self.board.reset(); self.fixed_pawn_positions.clear()
+        self.board.is_playing = True; self.in_game = True
         self._joining_table = False
         self.last_action_timestamp = time.time()
+        
         if self.engine and self.engine.alive():
             try:
                 with self.engine.engine_lock:
                     self.engine.proc.stdin.write("ucinewgame\n")
                     self.engine.proc.stdin.flush()
-            except Exception:
-                pass
+            except: pass
+            
         try:
             player_count = msg.read_byte()
-            for _ in range(player_count):
-                msg.read_byte(); msg.read_int()
-            piece_count = msg.read_byte()
-            board_pieces = []
+            for _ in range(player_count): msg.read_byte(); msg.read_int()
+            piece_count = msg.read_byte(); board_pieces = []
             parsed_event = getattr(self, "_decoded_ws_event", None)
             parsed_pieces = (parsed_event or {}).get("pieces", [])
             for index in range(piece_count):
-                # Consume the wire bytes for the normal message reader. The
-                # shared parser supplies the exact same decoded piece data.
                 raw_sid = msg.read_byte(); raw_face = msg.read_byte()
                 pos = msg.read_byte(); is_open = msg.read_byte()
                 if index < len(parsed_pieces):
                     p = parsed_pieces[index]
-                    board_pieces.append((p["sid_decoded"], p["face_decoded"],
-                                         p["position"], p["is_open"]))
+                    board_pieces.append((p["sid_decoded"], p["face_decoded"], p["position"], p["is_open"]))
                 else:
-                    board_pieces.append((self._decode_piece_id(raw_sid),
-                                         self._decode_piece_id(raw_face),
-                                         pos, is_open))
+                    board_pieces.append((self._decode_piece_id(raw_sid), self._decode_piece_id(raw_face), pos, is_open))
+            
             msg.read_byte(); mystery_count = msg.read_byte()
             for _ in range(mystery_count): msg.read_byte()
             msg.read_byte(); msg.read_byte()
             first_turn_slot_id = msg.read_byte()
             my_slot_id = msg.read_byte()
             if my_slot_id < 0 or my_slot_id == 255:
-                my_slot_id = (self.board.my_slot_id
-                              if self.board.my_slot_id >= 0
-                              else first_turn_slot_id)
-            self.board.set_my_slot(my_slot_id, first_turn_slot_id)
-            _built_fen = self._build_fen_from_pieces(board_pieces)
-            _ok, _why = self.board.sanity_check_fen(_built_fen)
-            if not _ok:
-                print(f"[FEN] ⚠️ Bad orientation ({_why}) -> flip")
-                self.board.flip = not self.board.flip
-                _rebuilt = self._rebuild_fen_with_current_flip(board_pieces)
-                _ok2, _why2 = self.board.sanity_check_fen(_rebuilt)
-                if _ok2:
-                    _built_fen = _rebuilt
-                    print(f"[FEN] ✅ flip={self.board.flip}")
-                else:
-                    print(f"[FEN] ❌ Still bad ({_why2})")
-                    self.board.flip = not self.board.flip
-            self.board.set_base(_built_fen, 'w')
+                my_slot_id = self.board.my_slot_id if self.board.my_slot_id >= 0 else first_turn_slot_id
             
-            # ★ Set visible board from actual piece data
+            self.board.set_my_slot(my_slot_id, first_turn_slot_id)
+            self.board.detect_flip(board_pieces)
+            fen = self._rebuild_fen_with_current_flip(board_pieces)
+            
+            _ok, _ = self.board.sanity_check_fen(fen)
+            if not _ok:
+                self.board.flip = not self.board.flip
+                fen = self._rebuild_fen_with_current_flip(board_pieces)
+                
+            self.board.set_base(fen, 'w')
             self.visible_board.set_from_pieces(board_pieces, self.board.flip)
-            self.visible_board.side_to_move = 'w'
+            
             for sid, face, position, is_open in board_pieces:
-                if not is_open and 0 <= position < 90:
-                    self.board.dark_positions.add(position)
-                piece_type = int(face[1]) if len(face) > 1 else 0
-                if piece_type == 7 and position not in STANDARD_PAWN_POSITIONS:
-                    self.fixed_pawn_positions.add(position)
-            if self.fixed_pawn_positions:
-                print(f"[GAME] 🛡️ {len(self.fixed_pawn_positions)} locked pawns")
-            self.board.revealed_chars = []
-            print(f"[FEN] 📋 {self.board.start_fen}")
-            print(f"[START] BAG={self.board.bag_string()}")
-            print(f"[START] dark={len(self.board.dark_positions)} | "
-                  f"my_slot={my_slot_id} | first={first_turn_slot_id} | "
-                  f"flip={self.board.flip}")
-            # ★ KHÔNG gửi setflip — engine flipchess (AB-JChess 0.2d) không hỗ trợ
-            # (giống PikaJieQi jieqi_old — cùng encode dark state vào FEN BAG field)
-            # Bot đã tự track flip phía Python qua XiangqiBoardTracker.detect_flip()
-            # và encode/decode UCI move theo flip đó. Engine tự xử lý dark piece state qua
-            # BAG field trong FEN và move suffixes (c3c4N) trong moves list.
-        except Exception as e:
-            print(f"[START_MATCH ERROR] {e}")
-            traceback.print_exc()
-
-    def _build_fen_from_pieces(self, pieces):
-        self.board.detect_flip(pieces)
-        return self._rebuild_fen_with_current_flip(pieces)
+                if not is_open and 0 <= position < 90: self.board.dark_positions.add(position)
+        except: pass
 
     def _rebuild_fen_with_current_flip(self, pieces):
         board = [['.' for _ in range(9)] for _ in range(10)]
         for sid, face, position, is_open in pieces:
             if position < 0 or position >= 90: continue
             fen_row, col = self.board.pos_to_rc(position)
-            # ★ SEE ALL PIECES: use decoded face for ALL pieces (even hidden)
-            # Server sends raw_face = actual piece type for every piece
             if len(face) > 1:
                 color = face[0]; piece_type = int(face[1])
-                type_to_fen = {1: 'k', 2: 'a', 3: 'b', 4: 'r',
-                               5: 'c', 6: 'n', 7: 'p'}
+                type_to_fen = {1: 'k', 2: 'a', 3: 'b', 4: 'r', 5: 'c', 6: 'n', 7: 'p'}
                 fen_char = type_to_fen.get(piece_type, '?')
                 if color == 'r': fen_char = fen_char.upper()
             else:
@@ -1737,8 +1110,7 @@ class JieqiCupBot:
         for row in board:
             fen_row = ""; empty = 0
             for cell in row:
-                if cell == '.':
-                    empty += 1
+                if cell == '.': empty += 1
                 else:
                     if empty > 0: fen_row += str(empty); empty = 0
                     fen_row += cell
@@ -1746,397 +1118,231 @@ class JieqiCupBot:
             fen_rows.append(fen_row)
         return '/'.join(fen_rows) + ' w'
 
-    PIECE_TYPE_MAP = {1: 'k', 2: 'a', 3: 'b', 4: 'r', 5: 'c', 6: 'n', 7: 'p'}
-
-    @classmethod
-    def _sid_to_fen_char(cls, byte_val):
-        v = byte_val - 256 if byte_val > 127 else byte_val
-        if v == 0: return None
-        ch = cls.PIECE_TYPE_MAP.get(abs(v) >> 3)
-        if not ch: return None
-        return ch.upper() if v > 0 else ch
-
-    def _handle_move(self, msg):
-        with self._move_lock:
-            self._move_recv_count += 1
-            try:
-                if not self.board.is_playing:
-                    self._move_skip_count += 1
-                    return
-                source_pos = msg.read_byte()
-                target_pos = msg.read_byte()
-                if not (0 <= source_pos < 90 and 0 <= target_pos < 90):
-                    self._move_skip_count += 1
-                    return
-                engine_move = self.board.pos_to_engine_move(source_pos, target_pos)
-                self.last_action_timestamp = time.time()
-                if not UCI_MOVE_RE.match(engine_move):
-                    self._move_error_count += 1
-                    return
-                # ws_frame_dump is the single wire-decoding source. The
-                # message reader above only advances the protocol offset;
-                # reveal decoding comes from the shared MOVE event.
-                event = getattr(self, "_decoded_ws_event", None) or {}
-                event_source = event.get("source")
-                event_target = event.get("target")
-                if event_source != source_pos or event_target != target_pos:
-                    raise ValueError(
-                        f"MOVE parser mismatch: wire={source_pos}->{target_pos} "
-                        f"dump={event_source}->{event_target}"
-                    )
-                if event.get("stale"):
-                    # Replay/state-sync (ô nguồn trống) — không phải nước mới
-                    self._move_skip_count += 1
-                    return
-                mover_dark = source_pos in self.board.dark_positions
-                is_flip_move = (source_pos == target_pos)
-                captured_dark = (not is_flip_move) and (target_pos in self.board.dark_positions)
-                revealed_char = event.get("revealed_piece")
-                if revealed_char in ('k', 'K'):
-                    revealed_char = None
-                if revealed_char and not (mover_dark or is_flip_move):
-                    print(f"[MOVE] parser reveal on open square: {revealed_char}", flush=True)
-                    revealed_char = None
-                captured_char = event.get("captured_piece")
-                if captured_char in ('k', 'K'):
-                    captured_char = None
-                if captured_char and not captured_dark:
-                    captured_char = None
-                self.board.dark_positions.discard(source_pos)
-                self.board.dark_positions.discard(target_pos)
-                full_uci = engine_move + (revealed_char or "") + (captured_char or "")
-                now = time.time()
-                if (self._last_move_uci == full_uci
-                        and (now - self._last_move_time) < MOVE_DEDUP_WINDOW):
-                    self._move_skip_count += 1
-                    return
-                self.board.record_move(engine_move, (revealed_char or "") + (captured_char or ""))
-                # ★ Update visible board
-                src_pos, tgt_pos = self.board.engine_move_to_pos(engine_move)
-                self.visible_board.apply_move(src_pos, tgt_pos)
-                self.visible_board.flip_side()
-                self._last_move_uci = full_uci
-                self._last_move_time = now
-                self._played_this_turn = False
-                print(f"[MOVE] #{self._move_recv_count} {engine_move} -> "
-                      f"'{full_uci}' | uci={len(self.board.uci_moves)} "
-                      f"revealed={len(self.board.revealed_chars)} "
-                      f"| BAG={self.board.bag_string()}", flush=True)
-            except Exception as e:
-                self._move_error_count += 1
-                print(f"[MOVE ERROR] err={e}", flush=True)
-                traceback.print_exc()
-
-    def _handle_play_response(self, msg):
-        status = msg.read_byte()
-        err_text = ""
-        try:
-            if msg.rem() >= 2: err_text = msg.read_string()
-        except Exception: pass
-        print(f"[PLAY-RESP] status={status} err={err_text!r}", flush=True)
-        if status != 0:
-            self._play_reject_count += 1
-            self.board.is_my_turn = True
-            self._played_this_turn = False
-            print(f"[PLAY] ⚠️ Reject #{self._play_reject_count} err={err_text!r}", flush=True)
-            if self._last_sent_move:
-                self._rejected_moves.add(self._last_sent_move)
-            if self._play_reject_count <= 3:
-                threading.Thread(target=lambda: (time.sleep(0.5), self._make_auto_move()),
-                                 daemon=True).start()
-        else:
-            self._play_reject_count = 0
-            self._rejected_moves.clear()
-
-    def _handle_set_turn(self, msg):
-        try:
-            slot_id = msg.read_byte()
-            try:
-                turn_timeout = msg.read_short()
-            except Exception:
-                turn_timeout = 0
-            if slot_id == -2 or slot_id == -1 or not self.board.is_playing: return
-            self.turn_timeout = turn_timeout
-            was_my_turn = self.board.is_my_turn
-            self.board.is_my_turn = (slot_id == self.board.my_slot_id)
-            self.last_action_timestamp = time.time()
-            if not self.board.is_my_turn: return
-            self._turn_started_at = time.time()
-            self._turn_deadline = self._turn_started_at + max(turn_timeout - 5, 10)
-            self._played_this_turn = False
-            self._moves_len_at_turn_start = len(self.board.uci_moves)
-            if not was_my_turn:
-                print(f"[TURN] My turn | uci={len(self.board.uci_moves)} "
-                      f"| timeout={turn_timeout}s", flush=True)
-            threading.Thread(target=self._make_auto_move, daemon=True).start()
-        except Exception as e:
-            print(f"[SET_TURN ERROR] {e}")
-            traceback.print_exc()
-
-    def _handle_kick_response(self, msg):
-        try:
-            status = msg.read_byte(); content = msg.read_string()
-        except Exception: status, content = None, ""
-        if self._pending_kick_id is not None:
-            pid = self._pending_kick_id; self._pending_kick_id = None
-            print(f"[KICK] {'✅' if status == 0 else '❌'} pid={pid}")
-            return
-        print(f"[KICK] Kicked: {content}")
-        self.in_game = False; self._joining_table = False
-        self._table_path = None; self.board.reset()
-
-    def _handle_gameover(self, msg):
-        my_result, results = None, {}
-        try:
-            count = msg.read_byte()
-            for _ in range(count):
-                sid = msg.read_byte(); res = msg.read_byte(); msg.read_long()
-                results[sid] = res
-                if sid == self.board.my_slot_id: my_result = res
-        except Exception:
-            results = {}
-
-        bot_won = my_result in (1, 11)
-        bot_lost = my_result in (2, 4, 12)
-        if bot_won:
-            print("[GAME] 🏁 WIN")
-        elif bot_lost:
-            print("[GAME] 🏁 LOSE")
-        elif my_result is None:
-            print("[GAME] 🏁 END")
-        else:
-            print("[GAME] 🏁 DRAW")
-
-        print(f"[SUMMARY] #{self._game_seq} | uci={len(self.board.uci_moves)} | "
-              f"revealed={len(self.board.revealed_chars)} | "
-              f"recv={self._move_recv_count} skip={self._move_skip_count} "
-              f"err={self._move_error_count} reject={self._play_reject_count}",
-              flush=True)
-
-        self.board.is_playing = False
-        self.board.is_my_turn = False
-        self.fixed_pawn_positions.clear()
-        self.board.reset()
-        self.in_game = True
-        self._joining_table = False
-        self.last_action_timestamp = time.time()
-        self._thinking = False
-        self._played_this_turn = False
-        self._turn_started_at = 0.0
-        self._turn_deadline = 0.0
-
-        if self.engine and self.engine.alive():
-            try:
-                with self.engine.engine_lock:
-                    self.engine.proc.stdin.write("ucinewgame\n")
-                    self.engine.proc.stdin.flush()
-            except Exception:
-                pass
-
-        def after_gameover():
-            print("[GAME] 🔄 Ở lại bàn, sẵn sàng cho ván mới (không kick / không rời)...")
-            time.sleep(3.0)
-            if self.connected and not self.board.is_playing:
-                self.send_ready(1)
-
-        threading.Thread(target=after_gameover, daemon=True).start()
-
-    def _make_auto_move(self):
-        if not self.board.is_my_turn or not self.board.is_playing: return
-        if self._thinking: return
-        self._thinking = True
-        try:
-            self._do_auto_move()
-        except Exception as e:
-            print(f"[MOVE-THREAD] Crash: {e}")
-            traceback.print_exc()
-        finally:
-            self._thinking = False
-
-    def _do_auto_move(self):
-        if not self.engine:
-            print("[ENGINE] ❌ Không có engine")
-            return
-        if not self.engine.alive():
-            print("[ENGINE] ❌ Engine chết giữa ván — thử restart...", flush=True)
-            if not self.engine.restart():
-                print("[ENGINE] ❌ Restart thất bại — bỏ lượt", flush=True)
-                return
-            print("[ENGINE] ✅ Restart OK — đi tiếp", flush=True)
-        now = time.time()
-        deadline = self._turn_deadline if self._turn_deadline > 0 else (now + MOVE_DEADLINE_SECONDS)
-        remain = deadline - now
-        if remain < 4.0:
-            print(f"[TURN] Sắp hết giờ (remain={remain:.1f}s) — bỏ lượt")
-            return
-        movetime_ms = DEFAULT_MOVETIME_MS  # 3000ms — AB-JChess NNUE cần thời gian để khai thác sức mạnh
-        fen, moves = self.board.get_current_fen()
-        print(f"[ENGINE-IN] FEN: {fen[:80]}...", flush=True)
-        print(f"[ENGINE-IN] moves({len(moves)}), movetime={movetime_ms}ms, remain={remain:.1f}s",
-              flush=True)
-        raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms)
-        if not raw:
-            print("[ENGINE] -> no bestmove, retrying...", flush=True)
-            if self.engine.restart():
-                raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms)
-            if not raw:
-                print("[ENGINE] ❌ Không có nước — bỏ lượt", flush=True)
-                return
-        parts = raw.split()
-        if len(parts) < 2: return
-        best_move = parts[1]
-        print(f"[ENGINE-OUT] bestmove: {best_move} [d{self.engine._last_depth} {self.engine._last_score}]",
-              flush=True)
-        if best_move in self._rejected_moves:
-            print(f"[ENGINE] Rejected move {best_move}, skip", flush=True)
-            return
-        if best_move in ("(none)", "0000"):
-            self.board.is_my_turn = False
-            return
-        try:
-            source_pos, target_pos = self.board.engine_move_to_pos(best_move)
-            _turn_start = self._turn_started_at if self._turn_started_at > 0 else time.time()
-            _remain_min = MIN_MOVE_SECONDS - (time.time() - _turn_start)
-            if _remain_min > 0: time.sleep(_remain_min)
-            if not (self.board.is_my_turn and self.board.is_playing): return
-            if self._played_this_turn: return
-            print(f"-> Đi: {best_move} (pos {source_pos}->{target_pos}) "
-                  f"| uci={len(self.board.uci_moves)}", flush=True)
-            self._last_sent_move = best_move
-            self.send_play(source_pos, target_pos)
-            self._bot_move_count += 1  # ★ Tăng counter sau khi bot đi
-        except Exception as e:
-            print(f"[BOT ERROR] {e}")
-            traceback.print_exc()
-
     def _decode_piece_id(self, encoded_id):
         color = 'r'
         if encoded_id < 0: encoded_id = -encoded_id; color = 'b'
         return f"{color}{encoded_id >> 3}{'' if (encoded_id & 7) == 0 else (encoded_id & 7)}"
 
-    def start_keep_alive(self):
-        # 1 thread PING sống suốt đời — bản cũ sinh thread MỚI mỗi lần
-        # reconnect (khi reconnect liên tục sẽ có nhiều thread PING song song,
-        # traffic gấp đôi, server dễ đóng kết nối vì spam).
-        if self._keep_alive_started:
-            return
-        self._keep_alive_started = True
+    def _handle_move(self, msg):
+        with self._move_lock:
+            try:
+                if not self.board.is_playing: return
+                source_pos = msg.read_byte(); target_pos = msg.read_byte()
+                if not (0 <= source_pos < 90 and 0 <= target_pos < 90): return
+                
+                engine_move = self.board.pos_to_engine_move(source_pos, target_pos)
+                self.last_action_timestamp = time.time()
+                
+                event = getattr(self, "_decoded_ws_event", None) or {}
+                if event.get("stale"): return
+                
+                revealed_char = event.get("revealed_piece")
+                if revealed_char in ('k', 'K'): revealed_char = None
+                captured_char = event.get("captured_piece")
+                if captured_char in ('k', 'K'): captured_char = None
+                
+                self.board.dark_positions.discard(source_pos)
+                self.board.dark_positions.discard(target_pos)
+                
+                full_uci = engine_move + (revealed_char or "") + (captured_char or "")
+                self.board.record_move(engine_move, (revealed_char or "") + (captured_char or ""))
+                
+                src_pos, tgt_pos = self.board.engine_move_to_pos(engine_move)
+                self.visible_board.apply_move(src_pos, tgt_pos)
+                
+                self._last_move_uci = full_uci
+                self._played_this_turn = False
+            except: pass
 
+    def _handle_play_response(self, msg):
+        status = msg.read_byte()
+        if status != 0:
+            self._play_reject_count += 1
+            self.board.is_my_turn = True; self._played_this_turn = False
+            if self._last_sent_move: self._rejected_moves.add(self._last_sent_move)
+            if self._play_reject_count <= 3:
+                threading.Thread(target=lambda: (time.sleep(0.5), self._make_auto_move()), daemon=True).start()
+        else:
+            self._play_reject_count = 0; self._rejected_moves.clear()
+
+    def _handle_set_turn(self, msg):
+        try:
+            slot_id = msg.read_byte()
+            try: turn_timeout = msg.read_short()
+            except: turn_timeout = 0
+            if slot_id == -2 or slot_id == -1 or not self.board.is_playing: return
+            
+            self.board.is_my_turn = (slot_id == self.board.my_slot_id)
+            self.last_action_timestamp = time.time()
+            if not self.board.is_my_turn: return
+            
+            self._turn_started_at = time.time()
+            self._turn_deadline = self._turn_started_at + max(turn_timeout - 5, 10)
+            self._played_this_turn = False
+            threading.Thread(target=self._make_auto_move, daemon=True).start()
+        except: pass
+
+    def _handle_kick_response(self, msg):
+        self.in_game = False; self._joining_table = False
+        self.board.reset()
+
+    def _handle_gameover(self, msg):
+        self.board.is_playing = False; self.board.is_my_turn = False
+        self.fixed_pawn_positions.clear(); self.board.reset()
+        self.in_game = True; self._joining_table = False
+        self.last_action_timestamp = time.time()
+        self._thinking = False; self._played_this_turn = False
+        
+        if self.engine and self.engine.alive():
+            try:
+                with self.engine.engine_lock:
+                    self.engine.proc.stdin.write("ucinewgame\n")
+                    self.engine.proc.stdin.flush()
+            except: pass
+        threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1) if self.connected else None), daemon=True).start()
+
+    def _make_auto_move(self):
+        if not self.board.is_my_turn or not self.board.is_playing: return
+        if self._thinking: return
+        self._thinking = True
+        try: self._do_auto_move()
+        finally: self._thinking = False
+
+    def _do_auto_move(self):
+        if not self.engine or not self.engine.alive(): return
+        
+        now = time.time()
+        deadline = self._turn_deadline if self._turn_deadline > 0 else (now + MOVE_DEADLINE_SECONDS)
+        remain = deadline - now
+        if remain < 4.0: return
+        
+        movetime_ms = DEFAULT_MOVETIME_MS
+        fen, moves = self.board.get_current_fen()
+        raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms)
+        
+        if not raw: return
+        parts = raw.split()
+        if len(parts) < 2: return
+        best_move = parts[1]
+        
+        # =======================================================
+        # MAPHACK MULTIPV FILTERING
+        # =======================================================
+        candidates = dict(self.engine.multipv_info)
+        if best_move not in candidates:
+            candidates[best_move] = 0
+            
+        best_hacked_move = best_move
+        best_hacked_score = -float('inf')
+        
+        PIECE_VALS = {'r': 900, 'c': 500, 'n': 400, 'b': 200, 'a': 200, 'p': 100, 'k': 0}
+        EXPECTED_VAL = 300
+        
+        print(f"[MAPHACK] Đánh giá {len(candidates)} ứng viên từ MultiPV:")
+        for mv, base_score in candidates.items():
+            if mv in self._rejected_moves: continue
+            hacked_score = base_score
+            try:
+                src_pos, tgt_pos = self.board.engine_move_to_pos(mv)
+                mover_dark = src_pos in self.board.dark_positions
+                is_flip = (src_pos == tgt_pos)
+                captured_dark = (not is_flip) and (tgt_pos in self.board.dark_positions)
+                
+                # Thưởng/phạt khi lật quân mình
+                if mover_dark or is_flip:
+                    true_char = self.visible_board.cells[src_pos]
+                    if true_char != '.':
+                        val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
+                        hacked_score += (val - EXPECTED_VAL)
+                        
+                # Thưởng/phạt khi ăn quân úp của địch
+                if captured_dark:
+                    true_char = self.visible_board.cells[tgt_pos]
+                    if true_char != '.':
+                        val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
+                        hacked_score += (val - EXPECTED_VAL)
+                        
+                print(f"  - {mv}: Engine CP={base_score} -> Hack CP={hacked_score}")
+            except Exception:
+                pass
+                
+            if hacked_score > best_hacked_score:
+                best_hacked_score = hacked_score
+                best_hacked_move = mv
+                
+        if best_hacked_move != best_move:
+            print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm: {best_hacked_score})")
+        best_move = best_hacked_move
+        # =======================================================
+        
+        if best_move in ("(none)", "0000"):
+            self.board.is_my_turn = False; return
+            
+        try:
+            source_pos, target_pos = self.board.engine_move_to_pos(best_move)
+            _turn_start = self._turn_started_at if self._turn_started_at > 0 else time.time()
+            _remain_min = MIN_MOVE_SECONDS - (time.time() - _turn_start)
+            if _remain_min > 0: time.sleep(_remain_min)
+            
+            if not (self.board.is_my_turn and self.board.is_playing): return
+            if self._played_this_turn: return
+            
+            self._last_sent_move = best_move
+            self.send_play(source_pos, target_pos)
+        except: pass
+
+    def start_keep_alive(self):
+        if self._keep_alive_started: return
+        self._keep_alive_started = True
         def loop():
             while True:
                 time.sleep(10)
-                if self.connected:
-                    self.send_message("PING")
-
+                if self.connected: self.send_message("PING")
         threading.Thread(target=loop, daemon=True).start()
 
     def run(self):
-        print("[BOT] Khởi chạy cờ úp AB-JChess 0.2d v1.2 (stay-on-lose, NNUE)...")
         while True:
             try:
                 now_ts = time.time()
                 if self.connected:
                     idle = now_ts - self.last_recv_timestamp
-                    # Trong ván luôn có traffic (PING/PONG, SET_TURN, MOVE...)
-                    # -> 60s im lặng = connection chết lặng, reconnect ngay.
-                    # Ngoài ván (ngồi bàn chờ) giữ 120s như cũ để tránh
-                    # reconnect oan khi server không trả lời app-PING.
                     idle_limit = 60 if self.board.is_playing else 120
-                    if idle > idle_limit:
-                        self._disconnect(f"{int(idle)}s không nhận frame nào")
-                    elif (self._connected_since
-                          and not self.logged_in
-                          and now_ts - self._connected_since > 45):
-                        # Connected nhưng login treo (token sai / server im lặng)
-                        # -> bản cũ treo vĩnh viễn, không bao giờ reconnect.
-                        self._disconnect("45s chưa login xong")
-                    elif (self.board.is_playing
-                          and now_ts - self.last_action_timestamp > 300):
-                        self._disconnect(
-                            f"ván treo {int(now_ts - self.last_action_timestamp)}s")
+                    if idle > idle_limit: self._disconnect()
+                    elif self._connected_since and not self.logged_in and now_ts - self._connected_since > 45:
+                        self._disconnect()
 
                 if not self.connected:
-                    if self._reconnect_streak >= 3:
-                        print(f"[BOT] ⚠️ Tài khoản {USER} có thể đăng nhập chỗ khác")
                     if self._reconnect_streak > 0:
-                        delay = min(60, 5 * (2 ** min(self._reconnect_streak - 1, 4)))
-                        print(f"[WS] Rớt liên tiếp {self._reconnect_streak} -> chờ {delay}s")
-                        time.sleep(delay)
-                    if not fetch_session_info():
-                        time.sleep(5); continue
+                        time.sleep(min(60, 5 * (2 ** min(self._reconnect_streak - 1, 4))))
+                    if not fetch_session_info(): time.sleep(5); continue
                     self.logged_in = False; self.in_game = False
-                    self._joining_table = False
-                    self._bet_amts_loaded = False
-                    self._resolved_bet_id = None
-                    self.bet_amts = []; self.fixed_pawn_positions = set()
-                    self._thinking = False; self._played_this_turn = False
+                    self._joining_table = False; self._bet_amts_loaded = False
                     self.board.reset()
-                    if not self.connect():
-                        time.sleep(5); continue
-                    self.start_keep_alive()
-                    time.sleep(2)
+                    if not self.connect(): time.sleep(5); continue
+                    self.start_keep_alive(); time.sleep(2)
 
-                if (self.board.is_playing and self.board.is_my_turn
-                        and self._turn_deadline > 0
-                        and time.time() > self._turn_deadline - 4.0
-                        and not self._played_this_turn):
+                if (self.board.is_playing and self.board.is_my_turn and self._turn_deadline > 0
+                        and time.time() > self._turn_deadline - 4.0 and not self._played_this_turn):
                     if not self._thinking:
-                        print(f"[DEADLINE] Còn {int(self._turn_deadline - time.time())}s")
                         threading.Thread(target=self._make_auto_move, daemon=True).start()
 
-                if self.board.is_playing:
-                    self._sit_alone_since = None
+                if self.board.is_playing: self._sit_alone_since = None
                 else:
                     if self.in_game and not self._joining_table:
-                        opp_id = self.opponent_player_id()
-                        if opp_id is None:
-                            if self._sit_alone_since is None:
-                                self._sit_alone_since = time.time()
-                            else:
-                                elapsed = time.time() - self._sit_alone_since
-                                if elapsed >= SIT_ALONE_TIMEOUT:
-                                    print(f"[TABLE] Chờ {int(elapsed)}s -> rời bàn")
-                                    self.leave_table()
-                        else:
-                            self._sit_alone_since = None
+                        if self.opponent_player_id() is None:
+                            if self._sit_alone_since is None: self._sit_alone_since = time.time()
+                            elif time.time() - self._sit_alone_since >= SIT_ALONE_TIMEOUT: self.leave_table()
+                        else: self._sit_alone_since = None
 
-                if (self._enter_fail_at and self.in_game
-                        and not self.board.is_playing
-                        and time.time() - self._enter_fail_at > 60):
-                    print("[TABLE] 60s không vào ván -> bỏ bàn cũ")
-                    self._enter_fail_at = 0.0
-                    self.leave_table()
-
-                if (self.connected and self.logged_in and not self.in_game
-                        and not self._joining_table):
-                    now = time.time()
-                    if now - self._last_quick_play_time >= self._QUICK_PLAY_INTERVAL:
-                        if not self._bet_amts_loaded:
-                            self.send_list_bet_amt()
+                if self.connected and self.logged_in and not self.in_game and not self._joining_table:
+                    if time.time() - self._last_quick_play_time >= self._QUICK_PLAY_INTERVAL:
+                        if not self._bet_amts_loaded: self.send_list_bet_amt()
                         elif BOT_USE_CREATE_TABLE:
-                            bid = (self._resolved_bet_id
-                                   if self._resolved_bet_id is not None
-                                   else self.resolve_bet_amt_id())
-                            print(f"[CREATE] 🪑 Tạo bàn {BOT_BET_XU} xu (bet_id={bid})")
+                            bid = self._resolved_bet_id if self._resolved_bet_id else self.resolve_bet_amt_id()
                             self.send_create_table(bet_amt_id=bid)
-                        else:
-                            valid_bets = self.get_1k_to_5k_bet_objs()
-                            if valid_bets:
-                                bet_obj = random.choice(valid_bets)
-                                room = random.choice(self.ROOM_LIST)
-                                print(f"[SEARCH] 🔍 Dò bàn {bet_obj['value']} xu phòng '{room}'")
-                                self.send_quick_play(room_id=room, bet_amt_id=bet_obj['id'])
-                                self._quick_play_attempts += 1
-                            else:
-                                self.send_create_table()
-                                self._quick_play_attempts = 0
                 time.sleep(1)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"[RUN ERROR] {e}")
-                traceback.print_exc()
-                time.sleep(5)
+            except KeyboardInterrupt: break
+            except: time.sleep(5)
 
     def cleanup(self):
         if self.engine:
@@ -2144,9 +1350,7 @@ class JieqiCupBot:
                 if self.engine.proc:
                     self.engine.proc.stdin.write("quit\n")
                     self.engine.proc.stdin.flush()
-                    self.engine.proc.wait(timeout=2)
-            except Exception:
-                pass
+            except: pass
         if self.ws:
             try: self.ws.close()
             except: pass
@@ -2156,26 +1360,19 @@ def acquire_single_instance_lock():
         import fcntl
         path = os.path.join(tempfile.gettempdir(), f"xiangqi_bot_{USER}.lock")
         f = open(path, "w")
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print(f"[BOT] ❌ Đã có bot khác chạy tài khoản {USER}")
-            sys.exit(1)
+        try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except: sys.exit(1)
         f.write(str(os.getpid())); f.flush()
         atexit.register(lambda: (fcntl.flock(f, fcntl.LOCK_UN), f.close()))
         return f
-    except ImportError:
-        return None
+    except: return None
 
 if __name__ == "__main__":
     _lock = acquire_single_instance_lock()
     bot = JieqiCupBot()
-
     def signal_handler(sig, frame):
         bot.cleanup(); sys.exit(0)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    try:
-        bot.run()
-    finally:
-        bot.cleanup()
+    try: bot.run()
+    finally: bot.cleanup()
