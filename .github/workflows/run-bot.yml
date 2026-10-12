@@ -12,7 +12,7 @@ jobs:
   build-and-run:
     runs-on: ubuntu-latest
     # bot chay ~55 phut moi lan CI (gioi han cua GitHub Actions la 6h/job)
-    timeout-minutes: 60
+    timeout-minutes: 300
 
     steps:
       - name: Checkout
