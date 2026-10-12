@@ -122,6 +122,6 @@ jobs:
           CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
-          timeout --signal=INT --kill-after=30 3300 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
+          timeout --signal=INT --kill-after=300 3300 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
           echo "=== 30 dong cuoi bot.log ==="
           tail -n 30 bot.log || true
