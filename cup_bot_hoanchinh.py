@@ -346,7 +346,7 @@ requests = type('R', (), {'Session': _UrllibSession})()
 
 # ==================== TÀI KHOẢN ====================
 CARO_USER_DIRECT = "ngan27"
-CARO_PASSWD_DIRECT = "nhat123456"
+CARO_PASSWD_DIRECT = "$$$$$$"
 
 def _clean_env(val, default):
     if val and str(val).strip():
