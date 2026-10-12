@@ -1,13 +1,8 @@
 """
 cup_bot_flipchess_abjchess.py — Cờ Úp Bot dùng engine AB-JChess 0.2d build từ mistboard
-Tích hợp Maphack MultiPV Filtering: Đảm bảo đi đúng luật server nhưng lật/ăn quân dựa trên mặt thật.
-
-Engine: AB-JChess 0.2d (NNUE-based, Pikafish-derived Jieqi engine)
-  - Mạnh hơn PikaJieQi ~90 Elo @ 4s/move (mistboard benchmark)
-  - Yêu cầu CPU có AVX2/BMI2 (build với ARCH=x86-64-bmi2)
-  - Yêu cầu file NNUE (abjchess-20261010.nnue) — load qua setoption name EvalFile
-Movetime: 3000ms (~3s/nước)
-BAG updates: gửi kèm moves list để AB-JChess sync state (giống PikaJieQi)
+Tích hợp Dynamic Maphack: 
+ - Khai cuộc (6 nước đầu): Kích hoạt Maphack (MultiPV=3), ưu tiên lật Xe, Pháo, Mã thật.
+ - Trung/Tàn cuộc: Tắt Maphack (MultiPV=1), dồn 100% CPU cho engine tính toán chiều sâu chiến thuật.
 """
 import struct
 import threading
@@ -22,11 +17,10 @@ import tempfile
 import json
 import random
 import traceback
-import shutil
 import urllib.request, urllib.parse, http.cookiejar
 
 # ============================================================================
-# ws_frame_dump — EMBEDDED (file hoàn chỉnh, không cần ws_frame_dump.py rời)
+# ws_frame_dump — EMBEDDED
 # ============================================================================
 CMD_NAMES = {
     300: "PONG", 301: "PING", 302: "LOGIN", 303: "ALERT",
@@ -106,26 +100,20 @@ def decode_frame(data):
             pieces = []
             player_count = r.read_byte()
             for _ in range(max(0, player_count)):
-                r.read_byte()
-                r.read_int()
+                r.read_byte(); r.read_int()
             piece_count = r.read_byte()
-            new_pos_sid = {}
-            new_revealed = set()
+            new_pos_sid = {}; new_revealed = set()
             for _ in range(max(0, piece_count)):
-                raw_sid = r.read_byte()
-                raw_face = r.read_byte()
-                pos = r.read_byte()
-                is_open = r.read_byte()
+                raw_sid = r.read_byte(); raw_face = r.read_byte()
+                pos = r.read_byte(); is_open = r.read_byte()
                 pieces.append({
                     "sid_decoded": _decode_piece_id(raw_sid),
                     "face_decoded": _decode_piece_id(raw_face),
                     "position": pos,
                     "is_open": is_open,
                 })
-                if 0 <= pos < 90:
-                    new_pos_sid[pos] = raw_sid
-                if is_open:
-                    new_revealed.add(raw_sid)
+                if 0 <= pos < 90: new_pos_sid[pos] = raw_sid
+                if is_open: new_revealed.add(raw_sid)
             event["pieces"] = pieces
             _state.pos_sid = new_pos_sid
             _state.revealed = new_revealed
@@ -135,21 +123,18 @@ def decode_frame(data):
             if r.rem() >= 2:
                 event["source"] = src = r.read_byte()
                 event["target"] = tgt = r.read_byte()
-            else:
-                return event
+            else: return event
             count = r.read_byte() if r.rem() >= 1 else 0
             if count < 0: count = 0
             pairs = []
             for _ in range(min(count, r.rem() // 2)):
-                sid = r.read_byte()
-                face = r.read_byte()
+                sid = r.read_byte(); face = r.read_byte()
                 pairs.append((sid, face))
                 _state.identity[sid] = face
 
             mover_sid = _state.pos_sid.get(src)
             captured_sid = _state.pos_sid.get(tgt) if tgt != src else None
-            revealed_char = None
-            captured_char = None
+            revealed_char = None; captured_char = None
             for sid, face in pairs:
                 ch = _face_to_fen_char(face)
                 if ch in ('k', 'K'): ch = None
@@ -171,23 +156,6 @@ def decode_frame(data):
         return event
     except Exception as exc:
         return {"command": "?", "decode_error": f"{type(exc).__name__}: {exc}"}
-
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ws_frames.log")
-_LOG_MAX_BYTES = 8 * 1024 * 1024
-
-def log_incoming_frame(data):
-    try:
-        if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > _LOG_MAX_BYTES:
-            return
-        try:
-            cmd = decode_frame(data).get("command", "?")
-        except Exception:
-            cmd = "?"
-        line = f"{time.strftime('%H:%M:%S')} {cmd:<12} {data.hex(' ')}\n"
-        with open(_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
 
 # ============================================================================
 # HTTP SESSION 
@@ -212,7 +180,6 @@ class _UrllibSession:
         })
         for k, v in self.headers.d.items():
             self.op.addheaders.append((k, v))
-        self.last_url = ""
         self.cookies = self.cj
 
     def get(self, url, timeout=20, allow_redirects=True, **kw):
@@ -221,7 +188,6 @@ class _UrllibSession:
             for k, v in kw['headers'].items(): h.append((k, v))
         req = urllib.request.Request(url, headers=dict(h))
         r = self.op.open(req, timeout=timeout)
-        self.last_url = r.geturl()
         class R:
             def __init__(self, r):
                 self.text = r.read().decode("utf-8", "replace")
@@ -235,7 +201,6 @@ class _UrllibSession:
             for k, v in headers.items(): h[k] = v
         req = urllib.request.Request(url, data=body, headers=h)
         r = self.op.open(req, timeout=timeout)
-        self.last_url = r.geturl()
         class R:
             def __init__(self, r):
                 self.text = r.read().decode("utf-8", "replace")
@@ -269,10 +234,6 @@ ABJCHESS_BINARY_CANDIDATES = [
     os.environ.get("MISTBOARD_ABJCHESS_ENGINE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess")),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess.exe"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ab-jchess"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "abjchess"),
-    os.environ.get("MISTBOARD_JIEQI_ENGINE", ""), 
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "PikaJieQi"),
 ]
 ABJCHESS_BINARY_CANDIDATES = [p for p in ABJCHESS_BINARY_CANDIDATES if p]
 
@@ -285,14 +246,14 @@ ABJCHESS_NNUE_CANDIDATES = [
 )
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
+# --- Thông số Maphack & Engine ---
+MAPHACK_MOVE_LIMIT = 6        # Số nước đi đầu tiên của bot sẽ áp dụng gian lận nhìn xuyên thấu
+MAPHACK_MULTIPV = 3           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
 ENGINE_USE_AGGRESSIVE_LEVEL = 3
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
-ENGINE_MULTIPV = 5  # Bắt buộc bằng 5 để có đủ nhánh phân tích lật mặt quân
 MIN_MOVE_SECONDS = 3.0
 MOVE_DEADLINE_SECONDS = 30.0
-MAX_SAFE_MOVES = 250
 MAX_ENGINE_RESTARTS_PER_GAME = 2
-MOVE_DEDUP_WINDOW = 0.1
 DEFAULT_MOVETIME_MS = 3000
 
 KICK_MODE = "never"
@@ -303,8 +264,6 @@ BOT_MATCH_DURATION = '5'
 BOT_TURN_DURATION = '30'
 BOT_ACC_DURATION = '0'
 BOT_BLOCK_SOFTWARE = '0'
-
-_IDENTITY_SYNCED = True  
 
 def fetch_session_info():
     global COOKIE, TOKEN, CURRENT_PLAYER_NICKNAME, CURRENT_PLAYER_ID, PLACE_PATH
@@ -336,7 +295,7 @@ def fetch_session_info():
             COOKIE = "; ".join(cookie_parts)
         except Exception:
             COOKIE = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
-        print(f"[SESSION] Login OK | Token: {TOKEN} | Nick: {CURRENT_PLAYER_NICKNAME}")
+        print(f"[SESSION] Login OK | Nick: {CURRENT_PLAYER_NICKNAME}")
         return True
     except Exception as e:
         print(f"[SESSION] Lỗi: {e}")
@@ -410,16 +369,9 @@ class InboundMessage:
     def rem(self):
         return len(self.data) - self.offset
 
-STANDARD_PAWN_POSITIONS = set()
-for _c in [0, 2, 4, 6, 8]:
-    STANDARD_PAWN_POSITIONS.add(6 * 9 + _c)
-    STANDARD_PAWN_POSITIONS.add(3 * 9 + _c)
-
 INITIAL_BAG = {'A': 2, 'B': 2, 'N': 2, 'R': 2, 'C': 2, 'P': 5,
                'a': 2, 'b': 2, 'n': 2, 'r': 2, 'c': 2, 'p': 5}
 BAG_ORDER = ['A', 'B', 'N', 'R', 'C', 'P', 'a', 'b', 'n', 'r', 'c', 'p']
-
-UCI_MOVE_RE = re.compile(r'^[a-i]\d[a-i]\d$')
 UCI_MOVE_WITH_SUFFIX_RE = re.compile(r'^[a-i]\d[a-i]\d[a-zA-Z]{0,2}$')
 
 class XiangqiBoardTracker:
@@ -567,7 +519,7 @@ class FlipchessAbjchessEngine:
         self._restart_count = 0
         self._stdout_lines = []
         self._lines_lock = threading.Lock()
-        self.multipv_info = {}  # Lưu dictionary {move: cp_score} của các pv tốt nhất
+        self.multipv_info = {}  
 
         for path in ABJCHESS_BINARY_CANDIDATES:
             if path and os.path.isfile(path) and os.access(path, os.X_OK):
@@ -624,7 +576,6 @@ class FlipchessAbjchessEngine:
                     self._latest_bestmove = line
                     self._engine_searching = False
                 
-                # Parse MultiPV lines: info depth 12 multipv 1 score cp 320 pv c3c4 ...
                 if line.startswith("info") and " pv " in line:
                     try:
                         m_move = re.search(r' pv ([a-i]\d[a-i]\d)', line)
@@ -633,11 +584,9 @@ class FlipchessAbjchessEngine:
                             mv = m_move.group(1)
                             stype = m_score.group(1)
                             sval = int(m_score.group(2))
-                            if stype == "mate":
-                                sval = 90000 if sval > 0 else -90000
+                            if stype == "mate": sval = 90000 if sval > 0 else -90000
                             self.multipv_info[mv] = sval
-                    except Exception:
-                        pass
+                    except: pass
                         
         threading.Thread(target=consume_stdout, args=(self.proc,), daemon=True).start()
 
@@ -654,7 +603,7 @@ class FlipchessAbjchessEngine:
                 self.proc.stdin.write(f"setoption name Threads value {_threads}\n")
                 self.proc.stdin.write("setoption name Hash value 128\n")
                 self.proc.stdin.write(f"setoption name EvalFile value {self.nnue_path}\n")
-                self.proc.stdin.write(f"setoption name MultiPV value {ENGINE_MULTIPV}\n")
+                # Không fix cứng MultiPV ở khởi tạo nữa
                 self.proc.stdin.write(f"setoption name AggressiveLevel value {ENGINE_USE_AGGRESSIVE_LEVEL}\n")
                 self.proc.stdin.write(f"setoption name ChasingRule value {ENGINE_CHASING_RULE}\n")
                 self.proc.stdin.write("isready\n")
@@ -688,12 +637,13 @@ class FlipchessAbjchessEngine:
         self._init_engine()
         return self.alive()
 
-    def get_best_move(self, fen, moves, movetime_ms=DEFAULT_MOVETIME_MS, searchmoves=None):
+    # Thêm tham số multipv để Bot linh hoạt thay đổi tùy giai đoạn ván đấu
+    def get_best_move(self, fen, moves, movetime_ms=DEFAULT_MOVETIME_MS, searchmoves=None, multipv=1):
         if not self.alive():
             if not self.restart(): return None
         self._latest_bestmove = None
         self._engine_searching = True
-        self.multipv_info.clear()  # Reset maphack list
+        self.multipv_info.clear()  
         
         with self._lines_lock:
             self._stdout_lines.clear()
@@ -704,7 +654,10 @@ class FlipchessAbjchessEngine:
             if searchmoves:
                 sm_clean = [m for m in searchmoves if m and len(m) >= 4][:128]
                 if sm_clean: go_cmd += " searchmoves " + " ".join(sm_clean)
+            
             with self.engine_lock:
+                # Gửi lệnh set MultiPV trước khi tính toán
+                self.proc.stdin.write(f"setoption name MultiPV value {multipv}\n")
                 self.proc.stdin.write(cmd + "\n")
                 self.proc.stdin.flush()
                 self.proc.stdin.write(go_cmd + "\n")
@@ -737,8 +690,6 @@ class FlipchessAbjchessEngine:
             time.sleep(0.02)
         return self._latest_bestmove
 
-FlipchessJieqiEngine = FlipchessAbjchessEngine
-
 
 class JieqiCupBot:
     def __init__(self):
@@ -754,12 +705,10 @@ class JieqiCupBot:
         self._last_quick_play_time = 0
         self._QUICK_PLAY_INTERVAL = 3.0
         self.ROOM_LIST = ["0", "1", "2", "3"]
-        self._quick_play_attempts = 0
         self._sit_alone_since = None
         self.bet_amts = []
         self._resolved_bet_id = None
         self._bet_amts_loaded = False
-        self.fixed_pawn_positions = set()
         self.last_action_timestamp = time.time()
         self.last_recv_timestamp = time.time()
         self.slot_players = {}
@@ -767,8 +716,6 @@ class JieqiCupBot:
         self._connected_since = 0.0
         self._closing = False
         self._keep_alive_started = False
-        self._login_retry_count = 0
-        self._enter_fail_at = 0.0
         self.player_names = {}
         self._thinking = False
         self._turn_started_at = 0.0
@@ -779,8 +726,8 @@ class JieqiCupBot:
         self._play_reject_count = 0
         self._move_lock = threading.Lock()
         self._last_move_uci = None
-        self._last_move_time = 0.0
         self._game_seq = 0
+        self._bot_move_count = 0  # Trình theo dõi số nước đi của Bot
         self.engine = FlipchessAbjchessEngine()
 
     def _is_stale(self, ws):
@@ -794,8 +741,7 @@ class JieqiCupBot:
             if self.ws:
                 try: self.ws.close()
                 except: pass
-            self.connected = False
-            self.logged_in = False
+            self.connected = False; self.logged_in = False
         finally:
             self._closing = False
 
@@ -815,8 +761,7 @@ class JieqiCupBot:
             header={"Origin": "https://gamevh.net"})
         self.ws = app
         self.ws_thread = threading.Thread(
-            target=lambda: app.run_forever(ping_interval=20, ping_timeout=None),
-            daemon=True)
+            target=lambda: app.run_forever(ping_interval=20, ping_timeout=None), daemon=True)
         self.ws_thread.start()
         for _ in range(75):
             if self.connected: break
@@ -850,8 +795,7 @@ class JieqiCupBot:
         self.last_recv_timestamp = time.time()
         if isinstance(message, bytes):
             self._decoded_ws_event = None
-            try:
-                self._decoded_ws_event = decode_frame(message)
+            try: self._decoded_ws_event = decode_frame(message)
             except: pass
             self._handle_binary_message(message)
 
@@ -875,8 +819,7 @@ class JieqiCupBot:
             try:
                 self.ws.send(self.conn.pack(cmd, data), opcode=0x2)
                 return True
-            except:
-                self._disconnect(f"send fail")
+            except: self._disconnect(f"send fail")
         return False
 
     def _send_login(self):
@@ -903,7 +846,6 @@ class JieqiCupBot:
         if self.board.is_playing: return
         self.in_game = False; self._joining_table = False
         self.slot_players.clear(); self.board.reset()
-        self._enter_fail_at = 0.0
         self.send_enter_place(PLACE_PATH)
 
     def resolve_bet_amt_id(self):
@@ -966,8 +908,7 @@ class JieqiCupBot:
             elif cmd == "SET_TURN": self._handle_set_turn(msg)
             elif cmd == "GAMEOVER": self._handle_gameover(msg)
             elif cmd == "KICK_PLAYER": self._handle_kick_response(msg)
-        except Exception as e:
-            pass
+        except Exception: pass
 
     def _handle_login_response(self, msg):
         status = msg.read_byte()
@@ -1039,10 +980,11 @@ class JieqiCupBot:
 
     def _handle_start_match(self, msg):
         self._game_seq += 1
-        print(f"[GAME] 🎮 Match #{self._game_seq}")
+        print(f"\n[GAME] 🎮 Match #{self._game_seq}")
         self._thinking = False; self._played_this_turn = False
         self._play_reject_count = 0; self._rejected_moves = set()
-        self.board.reset(); self.fixed_pawn_positions.clear()
+        self._bot_move_count = 0  # Reset Move Tracker
+        self.board.reset()
         self.board.is_playing = True; self.in_game = True
         self._joining_table = False
         self.last_action_timestamp = time.time()
@@ -1118,11 +1060,6 @@ class JieqiCupBot:
             fen_rows.append(fen_row)
         return '/'.join(fen_rows) + ' w'
 
-    def _decode_piece_id(self, encoded_id):
-        color = 'r'
-        if encoded_id < 0: encoded_id = -encoded_id; color = 'b'
-        return f"{color}{encoded_id >> 3}{'' if (encoded_id & 7) == 0 else (encoded_id & 7)}"
-
     def _handle_move(self, msg):
         with self._move_lock:
             try:
@@ -1188,8 +1125,7 @@ class JieqiCupBot:
 
     def _handle_gameover(self, msg):
         self.board.is_playing = False; self.board.is_my_turn = False
-        self.fixed_pawn_positions.clear(); self.board.reset()
-        self.in_game = True; self._joining_table = False
+        self.board.reset(); self.in_game = True; self._joining_table = False
         self.last_action_timestamp = time.time()
         self._thinking = False; self._played_this_turn = False
         
@@ -1218,7 +1154,19 @@ class JieqiCupBot:
         
         movetime_ms = DEFAULT_MOVETIME_MS
         fen, moves = self.board.get_current_fen()
-        raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms)
+        
+        # =======================================================
+        # QUYẾT ĐỊNH SỬ DỤNG MAPHACK HAY KHÔNG
+        # =======================================================
+        use_maphack = self._bot_move_count < MAPHACK_MOVE_LIMIT
+        current_multipv = MAPHACK_MULTIPV if use_maphack else 1
+        
+        if use_maphack:
+            print(f"[TACTIC] Bot nước thứ {self._bot_move_count + 1}: Kích hoạt Maphack (MultiPV={current_multipv})")
+        else:
+            print(f"[TACTIC] Bot nước thứ {self._bot_move_count + 1}: TẮT Maphack, dồn 100% tài nguyên tính toán (MultiPV=1)")
+
+        raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms, multipv=current_multipv)
         
         if not raw: return
         parts = raw.split()
@@ -1226,53 +1174,48 @@ class JieqiCupBot:
         best_move = parts[1]
         
         # =======================================================
-        # MAPHACK MULTIPV FILTERING
+        # ÁP DỤNG MAPHACK FILTER (Chỉ khi use_maphack = True)
         # =======================================================
-        candidates = dict(self.engine.multipv_info)
-        if best_move not in candidates:
-            candidates[best_move] = 0
+        if use_maphack:
+            candidates = dict(self.engine.multipv_info)
+            if best_move not in candidates: candidates[best_move] = 0
+                
+            best_hacked_move = best_move
+            best_hacked_score = -float('inf')
             
-        best_hacked_move = best_move
-        best_hacked_score = -float('inf')
-        
-        PIECE_VALS = {'r': 900, 'c': 500, 'n': 400, 'b': 200, 'a': 200, 'p': 100, 'k': 0}
-        EXPECTED_VAL = 300
-        
-        print(f"[MAPHACK] Đánh giá {len(candidates)} ứng viên từ MultiPV:")
-        for mv, base_score in candidates.items():
-            if mv in self._rejected_moves: continue
-            hacked_score = base_score
-            try:
-                src_pos, tgt_pos = self.board.engine_move_to_pos(mv)
-                mover_dark = src_pos in self.board.dark_positions
-                is_flip = (src_pos == tgt_pos)
-                captured_dark = (not is_flip) and (tgt_pos in self.board.dark_positions)
-                
-                # Thưởng/phạt khi lật quân mình
-                if mover_dark or is_flip:
-                    true_char = self.visible_board.cells[src_pos]
-                    if true_char != '.':
-                        val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
-                        hacked_score += (val - EXPECTED_VAL)
-                        
-                # Thưởng/phạt khi ăn quân úp của địch
-                if captured_dark:
-                    true_char = self.visible_board.cells[tgt_pos]
-                    if true_char != '.':
-                        val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
-                        hacked_score += (val - EXPECTED_VAL)
-                        
-                print(f"  - {mv}: Engine CP={base_score} -> Hack CP={hacked_score}")
-            except Exception:
-                pass
-                
-            if hacked_score > best_hacked_score:
-                best_hacked_score = hacked_score
-                best_hacked_move = mv
-                
-        if best_hacked_move != best_move:
-            print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm: {best_hacked_score})")
-        best_move = best_hacked_move
+            # Nerf điểm Maphack để công bằng hơn với điểm chiến thuật CP
+            PIECE_VALS = {'r': 400, 'c': 200, 'n': 150, 'b': 50, 'a': 50, 'p': -50, 'k': -100} 
+            EXPECTED_VAL = 50 
+            
+            for mv, base_score in candidates.items():
+                if mv in self._rejected_moves: continue
+                hacked_score = base_score
+                try:
+                    src_pos, tgt_pos = self.board.engine_move_to_pos(mv)
+                    mover_dark = src_pos in self.board.dark_positions
+                    is_flip = (src_pos == tgt_pos)
+                    captured_dark = (not is_flip) and (tgt_pos in self.board.dark_positions)
+                    
+                    if mover_dark or is_flip:
+                        true_char = self.visible_board.cells[src_pos]
+                        if true_char != '.':
+                            val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
+                            hacked_score += (val - EXPECTED_VAL)
+                            
+                    if captured_dark:
+                        true_char = self.visible_board.cells[tgt_pos]
+                        if true_char != '.':
+                            val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
+                            hacked_score += (val - EXPECTED_VAL)
+                except: pass
+                    
+                if hacked_score > best_hacked_score:
+                    best_hacked_score = hacked_score
+                    best_hacked_move = mv
+                    
+            if best_hacked_move != best_move:
+                print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm tổng hợp: {best_hacked_score})")
+            best_move = best_hacked_move
         # =======================================================
         
         if best_move in ("(none)", "0000"):
@@ -1289,6 +1232,7 @@ class JieqiCupBot:
             
             self._last_sent_move = best_move
             self.send_play(source_pos, target_pos)
+            self._bot_move_count += 1  # Tăng số nước đã đi
         except: pass
 
     def start_keep_alive(self):
