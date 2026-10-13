@@ -1,8 +1,7 @@
 name: Cai dat thu vien & Chay Bot (6h)
 
 on:
-  push:
-    branches: [ main ]
+  # CHỈ CHẠY KHI BẤM NÚT THỦ CÔNG - KHÔNG TỰ CHẠY KHI PUSH
   workflow_dispatch:
 
 env:
