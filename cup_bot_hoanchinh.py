@@ -1155,16 +1155,21 @@ class JieqiCupBot:
         movetime_ms = DEFAULT_MOVETIME_MS
         fen, moves = self.board.get_current_fen()
         
-        # =======================================================
+                # =======================================================
         # QUYẾT ĐỊNH SỬ DỤNG MAPHACK HAY KHÔNG
         # =======================================================
-        use_maphack = self._bot_move_count < MAPHACK_MOVE_LIMIT
-        current_multipv = MAPHACK_MULTIPV if use_maphack else 1
-        
-        if use_maphack:
-            print(f"[TACTIC] Bot nước thứ {self._bot_move_count + 1}: Kích hoạt Maphack (MultiPV={current_multipv})")
+        if self._bot_move_count < 3:
+            current_multipv = 25  # Bắt engine liệt kê 25 nước để săn bằng được Xe
+            use_maphack = True
+            print(f"[TACTIC] Nước {self._bot_move_count + 1}: Bật radar TRUY TÌM XE (MultiPV={current_multipv})")
+        elif self._bot_move_count < 6:
+            current_multipv = 3   # Trở về maphack thường
+            use_maphack = True
+            print(f"[TACTIC] Nước {self._bot_move_count + 1}: Maphack dò mìn (MultiPV={current_multipv})")
         else:
-            print(f"[TACTIC] Bot nước thứ {self._bot_move_count + 1}: TẮT Maphack, dồn 100% tài nguyên tính toán (MultiPV=1)")
+            current_multipv = 1   # Tắt maphack, nhường 100% sức mạnh cho engine
+            use_maphack = False
+            print(f"[TACTIC] Nước {self._bot_move_count + 1}: TẮT Maphack, dồn 100% CPU đánh chiến thuật")
 
         raw = self.engine.get_best_move(fen, moves, movetime_ms=movetime_ms, multipv=current_multipv)
         
@@ -1183,8 +1188,12 @@ class JieqiCupBot:
             best_hacked_move = best_move
             best_hacked_score = -float('inf')
             
-            # Nerf điểm Maphack để công bằng hơn với điểm chiến thuật CP
-            PIECE_VALS = {'r': 400, 'c': 200, 'n': 150, 'b': 50, 'a': 50, 'p': -50, 'k': -100} 
+            # Ở 3 nước đầu, bơm điểm Xe, Pháo lên mức tuyệt đối để ÉP chọn
+            if self._bot_move_count < 3:
+                PIECE_VALS = {'r': 5000, 'c': 2000, 'n': 500, 'b': 50, 'a': 50, 'p': -50, 'k': -100}
+            else:
+                PIECE_VALS = {'r': 400, 'c': 200, 'n': 150, 'b': 50, 'a': 50, 'p': -50, 'k': -100} 
+                
             EXPECTED_VAL = 50 
             
             for mv, base_score in candidates.items():
@@ -1214,9 +1223,10 @@ class JieqiCupBot:
                     best_hacked_move = mv
                     
             if best_hacked_move != best_move:
-                print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm tổng hợp: {best_hacked_score})")
+                print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm tổng: {best_hacked_score})")
             best_move = best_hacked_move
         # =======================================================
+
         
         if best_move in ("(none)", "0000"):
             self.board.is_my_turn = False; return
