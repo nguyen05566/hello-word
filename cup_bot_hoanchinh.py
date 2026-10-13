@@ -247,8 +247,8 @@ ABJCHESS_NNUE_CANDIDATES = [
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
 # --- Thông số Maphack & Engine ---
-MAPHACK_MOVE_LIMIT = 6        # Số nước đi đầu tiên của bot sẽ áp dụng gian lận nhìn xuyên thấu
-MAPHACK_MULTIPV = 3           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
+MAPHACK_MOVE_LIMIT = 3        # Số nước đi đầu tiên của bot sẽ áp dụng gian lận nhìn xuyên thấu
+MAPHACK_MULTIPV = 5           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
 ENGINE_USE_AGGRESSIVE_LEVEL = 3
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
 MIN_MOVE_SECONDS = 3.0
