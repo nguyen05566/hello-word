@@ -1174,6 +1174,30 @@ class JieqiCupBot:
         best_move = parts[1]
         
         # =======================================================
+        # DYNAMIC MOVE TIME: Đi nhanh khi có ưu thế
+        # =======================================================
+        current_score = self.engine.multipv_info.get(best_move, 0)
+        
+        # Xác định thời gian suy nghĩ dựa trên điểm số
+        if current_score >= 90000:  # Forced mate
+            dynamic_movetime = 500  # 0.5 giây - đi ngay
+            print(f"[FAST] ⚡ Mate found! Score={current_score}, movetime=0.5s")
+        elif current_score >= 500:  # Ưu thế lớn (>5 pawns)
+            dynamic_movetime = 1500  # 1.5 giây
+            print(f"[FAST] ⚡ Uu the lon! Score={current_score/100:+.1f}, movetime=1.5s")
+        elif current_score >= 300:  # Ưu thế vừa (>3 pawns)
+            dynamic_movetime = 2500  # 2.5 giây
+            print(f"[FAST] ⚡ Uu the vua! Score={current_score/100:+.1f}, movetime=2.5s")
+        elif current_score >= 150:  # Ưu thế nhỏ (>1.5 pawns)
+            dynamic_movetime = 3500  # 3.5 giây
+            print(f"[FAST] Uu the nho! Score={current_score/100:+.1f}, movetime=3.5s")
+        else:  # Bình thường hoặc劣势
+            dynamic_movetime = DEFAULT_MOVETIME_MS  # 5 giây bình thường
+            
+        # Cập nhật movetime
+        movetime_ms = min(movetime_ms, dynamic_movetime)
+        
+        # =======================================================
         # ÁP DỤNG MAPHACK FILTER (Chỉ khi use_maphack = True)
         # =======================================================
         if use_maphack:
@@ -1224,7 +1248,18 @@ class JieqiCupBot:
         try:
             source_pos, target_pos = self.board.engine_move_to_pos(best_move)
             _turn_start = self._turn_started_at if self._turn_started_at > 0 else time.time()
-            _remain_min = MIN_MOVE_SECONDS - (time.time() - _turn_start)
+            # Dynamic MIN_MOVE: đi nhanh hơn khi có ưu thế
+            if current_score >= 90000:
+                dynamic_min = 0.3  # Mate: chờ 0.3s
+            elif current_score >= 500:
+                dynamic_min = 1.0  # Ưu thế lớn: chờ 1s
+            elif current_score >= 300:
+                dynamic_min = 2.0  # Ưu thế vừa: chờ 2s
+            elif current_score >= 150:
+                dynamic_min = 3.0  # Ưu thế nhỏ: chờ 3s
+            else:
+                dynamic_min = MIN_MOVE_SECONDS  # Bình thường: chờ 5s
+            _remain_min = dynamic_min - (time.time() - _turn_start)
             if _remain_min > 0: time.sleep(_remain_min)
             
             if not (self.board.is_my_turn and self.board.is_playing): return
