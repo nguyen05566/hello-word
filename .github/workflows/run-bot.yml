@@ -1,4 +1,4 @@
-name: Cai dat thu vien & Chay Bot
+name: Cai dat thu vien & Chay Bot (6h)
 
 on:
   push:
@@ -11,8 +11,8 @@ env:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # bot chay ~55 phut moi lan CI (gioi han cua GitHub Actions la 6h/job)
-    timeout-minutes: 300
+    # GitHub Actions gioi han 6h/job → dat 350 phut de co buffer
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -115,13 +115,15 @@ jobs:
           python -m py_compile cup_bot_hoanchinh.py
           echo "Syntax OK"
 
-      # ---------- 5. CHAY BOT (55 phut) ----------
+      # ---------- 5. CHAY BOT (6 GIO) ----------
+      # 21000 giây = 350 phút ≈ 5.8 giờ
+      # Buffer 10 phút cho setup + cleanup
       - name: Chay bot
         env:
           CARO_USER19: ${{ secrets.CARO_USER19 }}
           CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
-          timeout --signal=INT --kill-after=300 3300 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
+          timeout --signal=INT --kill-after=300 21000 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
           echo "=== 30 dong cuoi bot.log ==="
           tail -n 30 bot.log || true
