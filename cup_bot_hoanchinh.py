@@ -249,7 +249,7 @@ ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 # --- Thông số Maphack & Engine ---
 MAPHACK_MOVE_LIMIT = 4      # Số nước đi đầu tiên của bot sẽ áp dụng gian lận nhìn xuyên thấu
 MAPHACK_MULTIPV = 3           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
-ENGINE_USE_AGGRESSIVE_LEVEL = 10
+ENGINE_USE_AGGRESSIVE_LEVEL = 3
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
 MIN_MOVE_SECONDS = 5.0
 MOVE_DEADLINE_SECONDS = 45.0
@@ -257,7 +257,7 @@ MAX_ENGINE_RESTARTS_PER_GAME = 2
 DEFAULT_MOVETIME_MS = 5000
 
 KICK_MODE = "never"
-SIT_ALONE_TIMEOUT = 600.0
+SIT_ALONE_TIMEOUT = 300.0
 BOT_BET_XU = 5000
 BOT_USE_CREATE_TABLE = True
 BOT_MATCH_DURATION = '5'
