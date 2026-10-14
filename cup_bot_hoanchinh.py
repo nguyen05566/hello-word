@@ -257,7 +257,7 @@ MAX_ENGINE_RESTARTS_PER_GAME = 2
 DEFAULT_MOVETIME_MS = 5000
 
 KICK_MODE = "never"
-SIT_ALONE_TIMEOUT = 300.0
+SIT_ALONE_TIMEOUT = 600.0
 BOT_BET_XU = 5000
 BOT_USE_CREATE_TABLE = True
 BOT_MATCH_DURATION = '5'
@@ -1285,7 +1285,7 @@ class JieqiCupBot:
                 now_ts = time.time()
                 if self.connected:
                     idle = now_ts - self.last_recv_timestamp
-                    idle_limit = 60 if self.board.is_playing else 120
+                    idle_limit = 300 if self.board.is_playing else 600
                     if idle > idle_limit: self._disconnect()
                     elif self._connected_since and not self.logged_in and now_ts - self._connected_since > 45:
                         self._disconnect()
