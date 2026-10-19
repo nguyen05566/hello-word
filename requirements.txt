@@ -1,4 +1,2 @@
-# Thư viện cần cho cup_chess_bot.py
+# Thư viện cần cho cup_bot_hoanchinh.py
 requests>=2.31.0
-websocket-client>=1.7.0
-python-chess>=1.999
