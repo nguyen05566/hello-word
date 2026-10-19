@@ -1164,6 +1164,7 @@ class JieqiCupBot:
         try: self._do_auto_move()
         finally: self._thinking = False
 
+
     def _do_auto_move(self):
         if not self.engine or not self.engine.alive(): return
         
@@ -1172,6 +1173,7 @@ class JieqiCupBot:
         remain = deadline - now
         if remain < 4.0: return
         
+        fen, moves = self.board.get_current_fen()
         
         # =======================================================
         # OPENING BOOK: Su dung opening book cho nhung nuoc di dau
@@ -1195,12 +1197,10 @@ class JieqiCupBot:
                         return
                     except: pass
         
-        movetime_ms = DEFAULT_MOVETIME_MS
-        fen, moves = self.board.get_current_fen()
-        
         # =======================================================
         # QUYẾT ĐỊNH SỬ DỤNG MAPHACK HAY KHÔNG
         # =======================================================
+        movetime_ms = DEFAULT_MOVETIME_MS
         use_maphack = self._bot_move_count < MAPHACK_MOVE_LIMIT
         current_multipv = MAPHACK_MULTIPV if use_maphack else 1
         
@@ -1228,20 +1228,20 @@ class JieqiCupBot:
         elif current_score >= 500:  # uu the lon (>5 pawns)
             dynamic_movetime = FAST_BIG_ADV_MOVETIME
             print(f"][FAST] Uu the lon! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
-        elif current_score >= 300:  # uu the vua (>3 pawns)
+        elif current_score >= 300:  # uu the va (>3 pawns)
             dynamic_movetime = FAST_MED_ADV_MOVETIME
-            print(f"][FAST] Uu the vua! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
+            print(f"][FAST] Uu the va! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
         elif current_score >= 150:  # uu the nho (>1.5 pawns)
             dynamic_movetime = FAST_SMALL_ADV_MOVETIME
             print(f"][FAST] Uu the nho! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
         else:  # Binh thuong
             dynamic_movetime = NORMAL_MOVETIME
             
-        # Cập nhật movetime
+        # Cap nhat movetime
         movetime_ms = min(movetime_ms, dynamic_movetime)
         
         # =======================================================
-        # ÁP DỤNG MAPHACK FILTER (Chỉ khi use_maphack = True)
+        # AP DUNG MAPHACK FILTER (Chi khi use_maphack = True)
         # =======================================================
         if use_maphack:
             candidates = dict(self.engine.multipv_info)
@@ -1250,10 +1250,10 @@ class JieqiCupBot:
             best_hacked_move = best_move
             best_hacked_score = -float('inf')
             
-            # Nerf điểm Maphack để công bằng hơn với điểm chiến thuật CP
             # Cai thien he thong gia tri quan co cho Maphack Filter
             PIECE_VALS = {'r': 900, 'c': 450, 'n': 350, 'b': 200, 'a': 200, 'p': 100, 'k': 0} 
             EXPECTED_VAL = 200  # Gia tri trung binh du kien
+            
             for mv, base_score in candidates.items():
                 if mv in self._rejected_moves: continue
                 hacked_score = base_score
@@ -1281,7 +1281,7 @@ class JieqiCupBot:
                     best_hacked_move = mv
                     
             if best_hacked_move != best_move:
-                print(f"[MAPHACK] ⚡ Đổi bestmove: {best_move} -> {best_hacked_move} (Điểm tổng hợp: {best_hacked_score})")
+                print(f"][MAPHACK] Doi bestmove: {best_move} -> {best_hacked_move} (Diem tong hop: {best_hacked_score})")
             best_move = best_hacked_move
         # =======================================================
         
@@ -1304,12 +1304,13 @@ class JieqiCupBot:
                 dynamic_min = MIN_MOVE_SECONDS  # binh thuong: cho toi thieu
             _remain_min = dynamic_min - (time.time() - _turn_start)
             if _remain_min > 0: time.sleep(_remain_min)
+            
             if not (self.board.is_my_turn and self.board.is_playing): return
             if self._played_this_turn: return
             
             self._last_sent_move = best_move
             self.send_play(source_pos, target_pos)
-            self._bot_move_count += 1  # Tăng số nước đã đi
+            self._bot_move_count += 1  # Tang so nuoc di da di
         except: pass
 
     def start_keep_alive(self):
