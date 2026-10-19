@@ -119,8 +119,6 @@ jobs:
       # Buffer 10 phút cho setup + cleanup
       - name: Chay bot
         env:
-          CARO_USER19: ${{ secrets.CARO_USER19 }}
-          CARO_PASSWD19: ${{ secrets.CARO_PASSWD19 }}
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
           timeout --signal=INT --kill-after=300 21000 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
