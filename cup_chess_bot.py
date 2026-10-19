@@ -73,7 +73,7 @@ WS_CANDIDATES = [
 # URL gamevh.net để thiết lập session HTTP trước khi kết nối WebSocket
 GAMEVH_BASE = "https://gamevh.net"
 GAMEVH_LOGIN_URL = "https://gamevh.net/login.jsp"
-GAMEVH_GAME_URL = "https://gamevh.net/play/mystery_xiangqi/0"
+GAMEVH_GAME_URL = "https://gamevh.net/play/chess-club/0"
 
 
 def now_ts():
