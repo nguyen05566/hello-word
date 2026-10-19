@@ -149,16 +149,36 @@ class Game8Session:
             sc, body = self._raw_get(GAMEVH_LOGIN_URL)
             log(f"[GAMEVH] GET login.jsp -> {sc}, len={len(body)}")
 
-            # 2. GET trang chơi để lấy TOKEN (mã phiên chơi)
-            sc, body = self._raw_get(GAMEVH_GAME_URL)
-            log(f"[GAMEVH] GET play/mystery_xiangqi -> {sc}, len={len(body)}")
-            tm = re.search(r"var\s+token\s*=\s*(-?\d+)", body)
-            if tm:
-                self.gamevh_token = int(tm.group(1))
-                log(f"[GAMEVH] Đã lấy TOKEN = {self.gamevh_token}")
-            else:
+            # 2. Thử nhiều URL pattern để lấy TOKEN từ trang chơi
+            self.gamevh_token = None
+            tried_urls = [
+                GAMEVH_GAME_URL,
+                f"{GAMEVH_BASE}/play/chess-club/0",
+                f"{GAMEVH_BASE}/play/chess_club/0",
+                f"{GAMEVH_BASE}/game/chess-club",
+                f"{GAMEVH_BASE}/chess-club",
+            ]
+            for url in tried_urls:
+                if self.gamevh_token is not None:
+                    break
+                sc, body = self._raw_get(url)
+                log(f"[GAMEVH] GET {url} -> {sc}, len={len(body)}")
+                # Thử nhiều pattern TOKEN
+                for pat in [
+                    r'var\s+token\s*=\s*(-?\d+)',
+                    r'token\s*[:=]\s*["\']?(-?\d+)["\']?',
+                    r'TOKEN\s*[:=]\s*["\']?(-?\d+)["\']?',
+                    r'"token"\s*[:=]\s*(-?\d+)',
+                ]:
+                    tm = re.search(pat, body)
+                    if tm:
+                        self.gamevh_token = int(tm.group(1))
+                        log(f"[GAMEVH] Đã lấy TOKEN = {self.gamevh_token} từ {url}")
+                        break
+
+            if self.gamevh_token is None:
                 self.gamevh_token = 566
-                log(f"[GAMEVH] Không tìm thấy TOKEN trong HTML, dùng mặc định {self.gamevh_token}")
+                log(f"[GAMEVH] Không tìm thấy TOKEN, dùng mặc định {self.gamevh_token}")
 
             # Lấy JSESSIONID từ cookie jar
             for c in self.cj:
@@ -461,6 +481,12 @@ class ChessWS:
             # Sau login, gửi ENTER_PLACE để vào phòng chơi
             import threading as _t
             _t.Timer(1.0, self._send_binary_enter_place).start()
+            # Sau ENTER_PLACE, lấy danh sách cược và tạo ván chơi
+            _t.Timer(2.0, self._send_binary_list_bet_amt).start()
+            _t.Timer(3.0, self._send_binary_quick_play).start()
+            _t.Timer(4.0, self._send_binary_create_rule).start()
+            # Gửi PING keepalive mỗi 20 giây
+            _t.Timer(20.0, self._send_binary_ping_loop).start()
         else:
             # Gửi thông điệp đăng ký JSON cho game8.io
             hello = {
@@ -472,14 +498,46 @@ class ChessWS:
             self.send({"type": "subscribe", "channel": "chess"})
             self.send({"type": "auth", "token": ACCESS_TOKEN})
 
-    def _send_binary_enter_place(self):
-        """Gửi ENTER_PLACE (cmd 401) để vào phòng chơi trên gamevh.net."""
+    def _send_binary_list_bet_amt(self):
+        """Gửi LIST_BET_AMT (cmd 413) để lấy danh sách mốc cược."""
         data = bytearray()
         data.extend(self._pack_ascii("Lobby.chess-club.0"))  # place_path
-        data.extend(self._pack_string(""))                   # empty string
         data.extend(self._pack_byte(1))                      # mode
         self.ws.send(bytes(data), opcode=0x2)
-        log(f"[WS] -> BINARY ENTER_PLACE")
+        log(f"[WS] -> BINARY LIST_BET_AMT")
+
+    def _send_binary_quick_play(self):
+        """Gửi QUICK_PLAY (cmd 408) để tìm ván chơi nhanh."""
+        data = bytearray()
+        data.extend(self._pack_ascii("Lobby.chess-club.0"))  # place_path
+        data.extend(self._pack_int(1000))                    # bet amount
+        data.extend(self._pack_byte(1))                      # mode
+        self.ws.send(bytes(data), opcode=0x2)
+        log(f"[WS] -> BINARY QUICK_PLAY (bet=1000)")
+
+    def _send_binary_create_rule(self):
+        """Gửi CREATE_RULE (cmd 405) để tạo bàn chơi mới."""
+        data = bytearray()
+        data.extend(self._pack_ascii("Lobby.chess-club.0"))  # place_path
+        data.extend(self._pack_int(1000))                    # bet amount
+        data.extend(self._pack_byte(1))                      # mode
+        self.ws.send(bytes(data), opcode=0x2)
+        log(f"[WS] -> BINARY CREATE_RULE (bet=1000)")
+
+    def _send_binary_ping_loop(self):
+        """Gửi PING (cmd 301) keepalive mỗi 20 giây."""
+        if not self.connected or not self.ws:
+            return
+        try:
+            data = bytearray()
+            data.extend(self._pack_byte(0))  # PING cmd
+            self.ws.send(bytes(data), opcode=0x2)
+            log(f"[WS] -> BINARY PING (keepalive)")
+            # Lập lịch gửi tiếp
+            import threading as _t
+            _t.Timer(20.0, self._send_binary_ping_loop).start()
+        except Exception as e:
+            log(f"[WS] Lỗi gửi PING: {e}")
 
     def _pack_string(self, value):
         encoded = value.encode('utf-16-be')
