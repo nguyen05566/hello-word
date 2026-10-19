@@ -247,14 +247,32 @@ ABJCHESS_NNUE_CANDIDATES = [
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
 # --- Thông số Maphack & Engine ---
-MAPHACK_MOVE_LIMIT = 6      # Số nước đi đầu tiên của bot sẽ áp dụng gian lận nhìn xuyên thấu
-MAPHACK_MULTIPV = 4           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
-ENGINE_USE_AGGRESSIVE_LEVEL = 3
+MAPHACK_MOVE_LIMIT = 10     # Tang so nuoc di su dung Maphack tu 6 len 10
+MAPHACK_MULTIPV = 8           # Tang MultiPV tu 4 len 8 de do min tot hon
+ENGINE_USE_AGGRESSIVE_LEVEL = 4  # Tang muc do tan cong
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
-MIN_MOVE_SECONDS = 1.5
+MIN_MOVE_SECONDS = 1.0       # Giam thoi gian cho toi thieu
 MOVE_DEADLINE_SECONDS = 35.0
-MAX_ENGINE_RESTARTS_PER_GAME = 2
-DEFAULT_MOVETIME_MS = 2500
+MAX_ENGINE_RESTARTS_PER_GAME = 3
+DEFAULT_MOVETIME_MS = 3000  # Tang thoi gian mac dinh cho engine suy nghi
+
+# Thong so cho Dynamic Time Management
+FAST_MATE_MOVETIME = 500      # 0.5s cho chieu chet
+FAST_BIG_ADV_MOVETIME = 1200  # 1.2s cho uu the lon
+FAST_MED_ADV_MOVETIME = 1800  # 1.8s cho uu the vua
+FAST_SMALL_ADV_MOVETIME = 2500 # 2.5s cho uu the nho
+NORMAL_MOVETIME = 2000       # 2.0s cho binh thuong
+
+# Opening Book Configuration
+USE_OPENING_BOOK = True  # Su dung opening book cho nhung nuoc di dau
+OPENING_BOOK_MOVES = 8   # So nuoc di su dung opening book
+# Dinh dang: {fen_start: move1 move2 move3 ...}
+OPENING_BOOK = {
+    # Cac khoi dau co ban
+    "xxxxkxxxx/9/1x5x1/x1x1x1x1x/9/9/X1X1X1X1X/1X5X1/9/XXXXKXXXX": ["e3d3", "h3g3", "e3f3", "h3i3"],
+    # Phong thu Ma
+    "xxxxkxxxx/9/1x5x1/x1x1x1x1x/9/9/X1X1X1X1X/1X5X1/9/XXXXKXXXX": ["b2e3", "g2e3", "b2f3", "g2f3"],
+}
 
 KICK_MODE = "never"
 SIT_ALONE_TIMEOUT = 300.0
@@ -599,16 +617,18 @@ class FlipchessAbjchessEngine:
 
         with self.engine_lock:
             try:
-                _threads = max(1, min(2, (os.cpu_count() or 2) - 1))
+                _threads = max(1, min(4, (os.cpu_count() or 4)))  # Tang luong tu 2 len 4
                 self.proc.stdin.write(f"setoption name Threads value {_threads}\n")
-                self.proc.stdin.write("setoption name Hash value 128\n")
+                self.proc.stdin.write("setoption name Hash value 256\n")  # Tang Hash tu 128 len 256
                 self.proc.stdin.write(f"setoption name EvalFile value {self.nnue_path}\n")
-                # Không fix cứng MultiPV ở khởi tạo nữa
+                # Cai thien cau hinh engine
                 self.proc.stdin.write(f"setoption name AggressiveLevel value {ENGINE_USE_AGGRESSIVE_LEVEL}\n")
                 self.proc.stdin.write(f"setoption name ChasingRule value {ENGINE_CHASING_RULE}\n")
                 self.proc.stdin.write("isready\n")
                 self.proc.stdin.flush()
-            except: return
+
+            except:
+                return
         self._wait_for_readyok(timeout=30)
 
     def _wait_for_line(self, prefix, timeout=10):
@@ -1152,6 +1172,29 @@ class JieqiCupBot:
         remain = deadline - now
         if remain < 4.0: return
         
+        
+        # =======================================================
+        # OPENING BOOK: Su dung opening book cho nhung nuoc di dau
+        # =======================================================
+        if USE_OPENING_BOOK and self._bot_move_count < OPENING_BOOK_MOVES:
+            fen_key = fen.split(' ')[0]  # Lay phan board cua FEN
+            if fen_key in OPENING_BOOK:
+                book_moves = OPENING_BOOK[fen_key]
+                if book_moves:
+                    # Chon nuoc di ngau nhien tu opening book
+                    best_move = random.choice(book_moves)
+                    print(f"][OPENING] Using book move: {best_move}")
+                    
+                    try:
+                        source_pos, target_pos = self.board.engine_move_to_pos(best_move)
+                        if not (self.board.is_my_turn and self.board.is_playing): return
+                        if self._played_this_turn: return
+                        self._last_sent_move = best_move
+                        self.send_play(source_pos, target_pos)
+                        self._bot_move_count += 1
+                        return
+                    except: pass
+        
         movetime_ms = DEFAULT_MOVETIME_MS
         fen, moves = self.board.get_current_fen()
         
@@ -1178,21 +1221,21 @@ class JieqiCupBot:
         # =======================================================
         current_score = self.engine.multipv_info.get(best_move, 0)
         
-        # Xác định thời gian suy nghĩ dựa trên điểm số
+        # Xac dinh thoi gian suy nghi dua tren diem so - Su dung thong so moi
         if current_score >= 90000:  # Forced mate
-            dynamic_movetime = 500  # 0.5 giây - đi ngay
-            print(f"[FAST] ⚡ Mate found! Score={current_score}, movetime=0.5s")
-        elif current_score >= 500:  # Ưu thế lớn (>5 pawns)
-            dynamic_movetime = 1000  # 1.5 giây
-            print(f"[FAST] ⚡ Uu the lon! Score={current_score/100:+.1f}, movetime=1.5s")
-        elif current_score >= 300:  # Ưu thế vừa (>3 pawns)
-            dynamic_movetime = 1500  # 2.5 giây
-            print(f"[FAST] ⚡ Uu the vua! Score={current_score/100:+.1f}, movetime=2.5s")
-        elif current_score >= 150:  # Ưu thế nhỏ (>1.5 pawns)
-            dynamic_movetime = 2000  # 3.5 giây
-            print(f"[FAST] Uu the nho! Score={current_score/100:+.1f}, movetime=3.5s")
-        else:  # Bình thường hoặc劣势
-            dynamic_movetime = 1800  # 1.8s cân bằng
+            dynamic_movetime = FAST_MATE_MOVETIME  # Su dung thong so tu cau hinh
+            print(f"][FAST] Mate found! Score={current_score}, movetime={dynamic_movetime/1000:.1f}s")
+        elif current_score >= 500:  # uu the lon (>5 pawns)
+            dynamic_movetime = FAST_BIG_ADV_MOVETIME
+            print(f"][FAST] Uu the lon! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
+        elif current_score >= 300:  # uu the vua (>3 pawns)
+            dynamic_movetime = FAST_MED_ADV_MOVETIME
+            print(f"][FAST] Uu the vua! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
+        elif current_score >= 150:  # uu the nho (>1.5 pawns)
+            dynamic_movetime = FAST_SMALL_ADV_MOVETIME
+            print(f"][FAST] Uu the nho! Score={current_score/100:+.1f}, movetime={dynamic_movetime/1000:.1f}s")
+        else:  # Binh thuong
+            dynamic_movetime = NORMAL_MOVETIME
             
         # Cập nhật movetime
         movetime_ms = min(movetime_ms, dynamic_movetime)
@@ -1208,9 +1251,9 @@ class JieqiCupBot:
             best_hacked_score = -float('inf')
             
             # Nerf điểm Maphack để công bằng hơn với điểm chiến thuật CP
-            PIECE_VALS = {'r': 500, 'c': 300, 'n': 200, 'b': 80, 'a': 80, 'p': -30, 'k': -80} 
-            EXPECTED_VAL = 50 
-            
+            # Cai thien he thong gia tri quan co cho Maphack Filter
+            PIECE_VALS = {'r': 900, 'c': 450, 'n': 350, 'b': 200, 'a': 200, 'p': 100, 'k': 0} 
+            EXPECTED_VAL = 200  # Gia tri trung binh du kien
             for mv, base_score in candidates.items():
                 if mv in self._rejected_moves: continue
                 hacked_score = base_score
@@ -1248,20 +1291,19 @@ class JieqiCupBot:
         try:
             source_pos, target_pos = self.board.engine_move_to_pos(best_move)
             _turn_start = self._turn_started_at if self._turn_started_at > 0 else time.time()
-            # Dynamic MIN_MOVE: đi nhanh hơn khi có ưu thế
+            # Dynamic MIN_MOVE: di nhanh hon khi co uu the - Su dung thong so moi
             if current_score >= 90000:
-                dynamic_min = 0.3  # Mate: chờ 0.3s
+                dynamic_min = 0.3  # Mate: cho 0.3s
             elif current_score >= 500:
-                dynamic_min = 1.0  # Ưu thế lớn: chờ 1s
+                dynamic_min = 0.8  # uu the lon: cho 0.8s
             elif current_score >= 300:
-                dynamic_min = 2.0  # Ưu thế vừa: chờ 2s
+                dynamic_min = 1.2  # uu the vua: cho 1.2s
             elif current_score >= 150:
-                dynamic_min = 3.0  # Ưu thế nhỏ: chờ 3s
+                dynamic_min = 1.5  # uu the nho: cho 1.5s
             else:
-                dynamic_min = MIN_MOVE_SECONDS  # Bình thường: chờ 5s
+                dynamic_min = MIN_MOVE_SECONDS  # binh thuong: cho toi thieu
             _remain_min = dynamic_min - (time.time() - _turn_start)
             if _remain_min > 0: time.sleep(_remain_min)
-            
             if not (self.board.is_my_turn and self.board.is_playing): return
             if self._played_this_turn: return
             
