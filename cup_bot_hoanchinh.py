@@ -1208,7 +1208,7 @@ class JieqiCupBot:
             best_hacked_score = -float('inf')
             
             # Nerf điểm Maphack để công bằng hơn với điểm chiến thuật CP
-            PIECE_VALS = {'r': 400, 'c': 200, 'n': 150, 'b': 50, 'a': 50, 'p': -50, 'k': -100} 
+            PIECE_VALS = {'r': 500, 'c': 300, 'n': 200, 'b': 80, 'a': 80, 'p': -30, 'k': -80} 
             EXPECTED_VAL = 50 
             
             for mv, base_score in candidates.items():
