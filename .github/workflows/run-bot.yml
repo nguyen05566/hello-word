@@ -118,7 +118,6 @@ jobs:
       # 21000 giây = 350 phút ≈ 5.8 giờ
       # Buffer 10 phút cho setup + cleanup
       - name: Chay bot
-        env:
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
           timeout --signal=INT --kill-after=300 21000 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
