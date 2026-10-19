@@ -1,2 +1,3 @@
-# Thư viện cần cho cup_bot_hoanchinh.py
+# Thư viện cần cho cup_chat_bot.py
 requests>=2.31.0
+websocket-client>=1.7.0

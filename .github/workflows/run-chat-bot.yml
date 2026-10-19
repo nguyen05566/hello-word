@@ -1,0 +1,51 @@
+name: Chay Chat Bot gamevh.net (6h)
+
+on:
+  # CHỈ CHẠY KHI BẤM NÚT THỦ CÔNG - KHÔNG TỰ CHẠY KHI PUSH
+  workflow_dispatch:
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    # GitHub Actions gioi han 6h/job → dat 350 phut de co buffer
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ---------- 1. CAI DAT THU VIEN PYTHON ----------
+      - name: Cai dat thu vien Python
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip list
+
+      # ---------- 2. KIEM TRA CU PHAP BOT ----------
+      - name: Kiem tra cu phap
+        run: |
+          python -m py_compile cup_chat_bot.py
+          echo "Syntax OK"
+
+      # ---------- 3. CHAY CHAT BOT (6 GIO) ----------
+      # 21000 giây = 350 phút ≈ 5.8 giờ
+      # Buffer 10 phút cho setup + cleanup
+      - name: Chay chat bot
+        run: |
+          # INT truoc de bot co the cleanup, KILL sau 30s neu treo
+          timeout --signal=INT --kill-after=300 21000 python -u cup_chat_bot.py 2>&1 | tee chat_bot.log || true
+          echo "=== 50 dong cuoi chat_bot.log ==="
+          tail -n 50 chat_bot.log || true
