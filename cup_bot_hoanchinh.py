@@ -251,10 +251,10 @@ MAPHACK_MOVE_LIMIT = 4      # Số nước đi đầu tiên của bot sẽ áp d
 MAPHACK_MULTIPV = 3           # Lấy 3 ứng viên tốt nhất để dò mìn trong 6 nước đầu
 ENGINE_USE_AGGRESSIVE_LEVEL = 3
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
-MIN_MOVE_SECONDS = 5.0
-MOVE_DEADLINE_SECONDS = 45.0
+MIN_MOVE_SECONDS = 1.5
+MOVE_DEADLINE_SECONDS = 35.0
 MAX_ENGINE_RESTARTS_PER_GAME = 2
-DEFAULT_MOVETIME_MS = 5000
+DEFAULT_MOVETIME_MS = 2500
 
 KICK_MODE = "never"
 SIT_ALONE_TIMEOUT = 300.0
@@ -928,11 +928,11 @@ class JieqiCupBot:
         if status != 0:
             if self._joining_table:
                 self._joining_table = False; self.in_game = True
-                threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
+                threading.Thread(target=lambda: (time.sleep(1.0), self.send_ready(1)), daemon=True).start()
             return
         if self._joining_table:
             self._joining_table = False; self.in_game = True
-            threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
+            threading.Thread(target=lambda: (time.sleep(1.0), self.send_ready(1)), daemon=True).start()
         elif not self.in_game:
             self.send_list_bet_amt()
 
@@ -942,7 +942,7 @@ class JieqiCupBot:
             table_path = msg.read_ascii()
             self.in_game = True; self._joining_table = True
             self._sit_alone_since = time.time()
-            threading.Thread(target=lambda: (time.sleep(0.5), self.send_enter_place(path=table_path, mode=1)), daemon=True).start()
+            threading.Thread(target=lambda: (time.sleep(0.2), self.send_enter_place(path=table_path, mode=1)), daemon=True).start()
         else: self._joining_table = False
 
     def _handle_list_bet_amt_response(self, msg):
@@ -972,7 +972,7 @@ class JieqiCupBot:
                 if player_id > 0:
                     self._sit_alone_since = None
                     if not self.board.is_playing:
-                        threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1)), daemon=True).start()
+                        threading.Thread(target=lambda: (time.sleep(1.0), self.send_ready(1)), daemon=True).start()
                 else:
                     if not self.board.is_playing and self.opponent_player_id() is None:
                         self._sit_alone_since = time.time()
@@ -1098,7 +1098,7 @@ class JieqiCupBot:
             self.board.is_my_turn = True; self._played_this_turn = False
             if self._last_sent_move: self._rejected_moves.add(self._last_sent_move)
             if self._play_reject_count <= 3:
-                threading.Thread(target=lambda: (time.sleep(0.5), self._make_auto_move()), daemon=True).start()
+                threading.Thread(target=lambda: (time.sleep(0.2), self._make_auto_move()), daemon=True).start()
         else:
             self._play_reject_count = 0; self._rejected_moves.clear()
 
@@ -1135,7 +1135,7 @@ class JieqiCupBot:
                     self.engine.proc.stdin.write("ucinewgame\n")
                     self.engine.proc.stdin.flush()
             except: pass
-        threading.Thread(target=lambda: (time.sleep(3.0), self.send_ready(1) if self.connected else None), daemon=True).start()
+        threading.Thread(target=lambda: (time.sleep(1.0), self.send_ready(1) if self.connected else None), daemon=True).start()
 
     def _make_auto_move(self):
         if not self.board.is_my_turn or not self.board.is_playing: return
@@ -1183,16 +1183,16 @@ class JieqiCupBot:
             dynamic_movetime = 500  # 0.5 giây - đi ngay
             print(f"[FAST] ⚡ Mate found! Score={current_score}, movetime=0.5s")
         elif current_score >= 500:  # Ưu thế lớn (>5 pawns)
-            dynamic_movetime = 1500  # 1.5 giây
+            dynamic_movetime = 1000  # 1.5 giây
             print(f"[FAST] ⚡ Uu the lon! Score={current_score/100:+.1f}, movetime=1.5s")
         elif current_score >= 300:  # Ưu thế vừa (>3 pawns)
-            dynamic_movetime = 2500  # 2.5 giây
+            dynamic_movetime = 1500  # 2.5 giây
             print(f"[FAST] ⚡ Uu the vua! Score={current_score/100:+.1f}, movetime=2.5s")
         elif current_score >= 150:  # Ưu thế nhỏ (>1.5 pawns)
-            dynamic_movetime = 3500  # 3.5 giây
+            dynamic_movetime = 2000  # 3.5 giây
             print(f"[FAST] Uu the nho! Score={current_score/100:+.1f}, movetime=3.5s")
         else:  # Bình thường hoặc劣势
-            dynamic_movetime = DEFAULT_MOVETIME_MS  # 5 giây bình thường
+            dynamic_movetime = 1800  # 1.8s cân bằng
             
         # Cập nhật movetime
         movetime_ms = min(movetime_ms, dynamic_movetime)
