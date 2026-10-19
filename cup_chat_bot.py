@@ -25,6 +25,7 @@ import websocket
 # CẤU HÌNH TÀI KHOẢN NGAN2 — CỜ ÚP (mystery_xiangqi)
 # ============================================================================
 USER = "ngan2"
+PASSWD = "nhat123456"
 WS_URL = "wss://gamevh.net/ws/gameServer"
 LOGIN_URL = "https://gamevh.net/login.jsp"
 GAME_URL = "https://gamevh.net/play/mystery_xiangqi/0"
@@ -139,6 +140,26 @@ def fetch_session_info():
     opener.addheaders = list(base_headers)
 
     try:
+        # 1. GET trang login để có JSESSIONID
+        req = urllib.request.Request(LOGIN_URL, headers=dict(opener.addheaders))
+        r = opener.open(req, timeout=20)
+        log(f"[SESSION] GET {LOGIN_URL} -> {r.status}")
+
+        # 2. POST login với username/password
+        post_data = urllib.parse.urlencode({
+            "redirect": "/",
+            "USER_NAME": USER,
+            "PASSWORD": PASSWD,
+            "AUTO_LOGIN": "true",
+            "LOGIN": "Đăng nhập",
+        }).encode()
+        login_headers = dict(opener.addheaders)
+        login_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(LOGIN_URL, data=post_data, headers=login_headers, method="POST")
+        r = opener.open(req, timeout=20)
+        log(f"[SESSION] POST {LOGIN_URL} -> {r.status}")
+
+        # 3. GET trang chơi để lấy TOKEN
         req = urllib.request.Request(GAME_URL, headers=dict(opener.addheaders))
         r = opener.open(req, timeout=20)
         html = r.read().decode("utf-8", "replace")
