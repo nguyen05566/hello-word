@@ -750,7 +750,8 @@ class JieqiCupBot:
         self.engine = FlipchessAbjchessEngine()
 
     def _is_stale(self, ws):
-        return ws is not None and self.ws is not None and ws is not self.ws
+        if self.ws is None: return False
+        return ws is not self.ws
 
     def _disconnect(self, reason=""):
         if self._closing: return
@@ -1090,7 +1091,6 @@ class JieqiCupBot:
                 self.last_action_timestamp = time.time()
                 
                 event = getattr(self, "_decoded_ws_event", None) or {}
-                if event.get("stale"): return
                 
                 revealed_char = event.get("revealed_piece")
                 if revealed_char in ('k', 'K'): revealed_char = None
