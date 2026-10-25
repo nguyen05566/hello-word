@@ -231,7 +231,8 @@ GAME_ID = 'mystery_xiangqi'
 PLACE_PATH = 'Lobby.mystery_xiangqi.0'
 
 ABJCHESS_BINARY_CANDIDATES = [
-    os.environ.get("MISTBOARD_ABJCHESS_ENGINE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess")),
+    os.environ.get("MISTBOARD_ABJCHESS_ENGINE", "/tmp/engines/pikafish-jieqi-wrapper"),
+    "/tmp/engines/pikafish-jieqi-wrapper",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "AB-JChess.exe"),
 ]
@@ -239,6 +240,7 @@ ABJCHESS_BINARY_CANDIDATES = [p for p in ABJCHESS_BINARY_CANDIDATES if p]
 
 ABJCHESS_NNUE_CANDIDATES = [
     os.environ.get("MISTBOARD_ABJCHESS_NNUE", ""),
+    "/tmp/engines/pikafish.nnue",
 ] + sorted(
     [os.path.join(d, f) for d in [os.path.dirname(os.path.abspath(__file__))]
      for f in os.listdir(d) if f.startswith("abjchess-") and f.endswith(".nnue")],
@@ -247,14 +249,14 @@ ABJCHESS_NNUE_CANDIDATES = [
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
 # --- Thông số Maphack & Engine ---
-MAPHACK_MOVE_LIMIT = 8     # Tang so nuoc di su dung Maphack tu 6 len 8
-MAPHACK_MULTIPV = 4           # Tang MultiPV tu 4 len 6 - GIA TRI HỢP LÝ
+MAPHACK_MOVE_LIMIT = 0     # Tat Maphack - choi engine thuan
+MAPHACK_MULTIPV = 2           # Tang MultiPV tu 4 len 6 - GIA TRI HỢP LÝ
 ENGINE_USE_AGGRESSIVE_LEVEL = 3  # Tang muc do tan cong nhẹ hơn
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
 MIN_MOVE_SECONDS = 1.0       # Giam thoi gian cho toi thieu
 MOVE_DEADLINE_SECONDS = 35.0
 MAX_ENGINE_RESTARTS_PER_GAME = 3
-DEFAULT_MOVETIME_MS = 3000  # Tang thoi gian mac dinh cho engine suy nghi
+DEFAULT_MOVETIME_MS = 5000  # Tang thoi gian mac dinh cho engine suy nghi
 
 # Thong so cho Dynamic Time Management
 FAST_MATE_MOVETIME = 500      # 0.5s cho chieu chet
@@ -276,7 +278,7 @@ OPENING_BOOK = {
 
 KICK_MODE = "never"
 SIT_ALONE_TIMEOUT = 300.0
-BOT_BET_XU = 5000
+BOT_BET_XU = 1000
 BOT_USE_CREATE_TABLE = True
 BOT_MATCH_DURATION = '5'
 BOT_TURN_DURATION = '30'
@@ -548,8 +550,7 @@ class FlipchessAbjchessEngine:
         for path in ABJCHESS_NNUE_CANDIDATES:
             if path and os.path.isfile(path):
                 self.nnue_path = path; break
-        if not self.nnue_path:
-            self.engine = False; return
+        # NNUE is optional for pikafish-jieqi (uses its own default)
 
         self._init_engine()
         self.engine = self.proc is not None
@@ -617,13 +618,11 @@ class FlipchessAbjchessEngine:
 
         with self.engine_lock:
             try:
-                _threads = max(1, min(4, (os.cpu_count() or 4)))  # Tang luong tu 2 len 4
+                _threads = max(1, min(8, (os.cpu_count() or 4)))  # Tang luong tu 2 len 8
                 self.proc.stdin.write(f"setoption name Threads value {_threads}\n")
-                self.proc.stdin.write("setoption name Hash value 256\n")  # Tang Hash tu 128 len 256
-                self.proc.stdin.write(f"setoption name EvalFile value {self.nnue_path}\n")
-                # Cai thien cau hinh engine
-                self.proc.stdin.write(f"setoption name AggressiveLevel value {ENGINE_USE_AGGRESSIVE_LEVEL}\n")
-                self.proc.stdin.write(f"setoption name ChasingRule value {ENGINE_CHASING_RULE}\n")
+                self.proc.stdin.write("setoption name Hash value 512\n")  # Tang Hash tu 256 len 512
+                if self.nnue_path:
+                    self.proc.stdin.write(f"setoption name EvalFile value {self.nnue_path}\n")
                 self.proc.stdin.write("isready\n")
                 self.proc.stdin.flush()
 
@@ -1246,14 +1245,15 @@ class JieqiCupBot:
         if use_maphack:
             candidates = dict(self.engine.multipv_info)
             if best_move not in candidates: candidates[best_move] = 0
-                
+
             best_hacked_move = best_move
             best_hacked_score = -float('inf')
-            
-            # Cai thien he thong gia tri quan co cho Maphack Filter
-            PIECE_VALS = {'r': 900, 'c': 450, 'n': 350, 'b': 200, 'a': 200, 'p': 100, 'k': 0} 
+
+            # Gia tri quan co cho Maphack Filter
+            PIECE_VALS = {'r': 900, 'c': 450, 'n': 350, 'b': 200, 'a': 200, 'p': 100, 'k': 0}
             EXPECTED_VAL = 200  # Gia tri trung binh du kien
-            
+            FLIP_BONUS = 50     # Thuong nho cho nuoc lat quan
+
             for mv, base_score in candidates.items():
                 if mv in self._rejected_moves: continue
                 hacked_score = base_score
@@ -1262,27 +1262,37 @@ class JieqiCupBot:
                     mover_dark = src_pos in self.board.dark_positions
                     is_flip = (src_pos == tgt_pos)
                     captured_dark = (not is_flip) and (tgt_pos in self.board.dark_positions)
-                    
+
                     if mover_dark or is_flip:
                         true_char = self.visible_board.cells[src_pos]
                         if true_char != '.':
                             val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
                             hacked_score += (val - EXPECTED_VAL)
-                            
+                        elif is_flip:
+                            hacked_score += FLIP_BONUS
+
                     if captured_dark:
                         true_char = self.visible_board.cells[tgt_pos]
                         if true_char != '.':
                             val = PIECE_VALS.get(true_char.lower(), EXPECTED_VAL)
                             hacked_score += (val - EXPECTED_VAL)
+                        else:
+                            hacked_score += FLIP_BONUS // 2
                 except: pass
-                    
+
                 if hacked_score > best_hacked_score:
                     best_hacked_score = hacked_score
                     best_hacked_move = mv
-                    
-            if best_hacked_move != best_move:
+
+            # Chi doi bestmove neu chenh lech diem khong qua lon (tranh override khi engine chac chan)
+            score_diff = best_hacked_score - (self.engine.multipv_info.get(best_move, 0) if hasattr(self.engine, 'multipv_info') else 0)
+            if best_hacked_move and best_hacked_move != best_move and abs(score_diff) < 300:
                 print(f"][MAPHACK] Doi bestmove: {best_move} -> {best_hacked_move} (Diem tong hop: {best_hacked_score})")
-            best_move = best_hacked_move
+            elif best_hacked_move and best_hacked_move != best_move:
+                print(f"][MAPHACK] Giu bestmove: {best_move} (chenh lech qua lon: {score_diff})")
+                best_hacked_move = best_move
+            if best_hacked_move:
+                best_move = best_hacked_move
         # =======================================================
         
         if best_move in ("(none)", "0000"):
