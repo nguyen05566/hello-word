@@ -4,8 +4,6 @@ on:
   # CHỈ CHẠY KHI BẤM NÚT THỦ CÔNG - KHÔNG TỰ CHẠY KHI PUSH
   workflow_dispatch:
 
-env:
-  ABJ_ZIP_URL: https://github.com/lxsgx23/AB-JChess/releases/download/v0.2b/0.2b_bmi2.zip
 
 jobs:
   build-and-run:
@@ -44,17 +42,15 @@ jobs:
           pip install -r requirements.txt
           pip list
 
-      # ---------- 3. LAY ENGINE AB-JChess + NNUE ----------
-      - name: Cache AB-JChess
+      # ---------- 3. LAY ENGINE Pikafish-Jieqi ----------
+      - name: Cache Pikafish-Jieqi
         id: cache-engine
         uses: actions/cache@v4
         with:
-          path: |
-            AB-JChess
-            abjchess-*.nnue
-          key: abjchess-v0.2b-avx2
+          path: /tmp/engines/pikafish-jieqi
+          key: pikafish-jieqi-v1
 
-      - name: Tai AB-JChess tu mistboard release
+      - name: Tai Pikafish-Jieqi tu mistboard release
         if: steps.cache-engine.outputs.cache-hit != 'true'
         run: |
           set -e
@@ -64,48 +60,17 @@ jobs:
           test -n "$TAG"
           curl -fsSL --retry 3 -o /tmp/eng.tar.gz \
             "https://github.com/brianhliou/mistboard/releases/download/$TAG/engines-x86-64-sse41-popcnt.tar.gz"
-          tar -xzf /tmp/eng.tar.gz -C /tmp ab-jchess
-          cp /tmp/ab-jchess "$GITHUB_WORKSPACE/AB-JChess"
-          chmod +x "$GITHUB_WORKSPACE/AB-JChess"
-          echo "✅ Binary lay tu mistboard release $TAG"
-
-      - name: Build AB-JChess tu source (fallback)
-        if: always() && hashFiles('AB-JChess') == ''
-        continue-on-error: true
-        run: |
-          work=$(mktemp -d)
-          git init -q "$work/abjchess"
-          git -C "$work/abjchess" fetch -q --depth 1 \
-            https://github.com/lxsgx23/AB-JChess.git 1ae95ca6a960fc0caf32e791a67c8438aab60483
-          git -C "$work/abjchess" checkout -q FETCH_HEAD
-          make -C "$work/abjchess/src" -j"$(nproc)" ARCH=x86-64-avx2 COMP=clang EXTRALDFLAGS=-static build \
-            || make -C "$work/abjchess/src" -j"$(nproc)" ARCH=x86-64-bmi2 COMP=gcc build
-          if [ -f "$work/abjchess/src/AB-JChess" ]; then
-            cp "$work/abjchess/src/AB-JChess" "$GITHUB_WORKSPACE/AB-JChess"
-            chmod +x "$GITHUB_WORKSPACE/AB-JChess"
-            echo "✅ Da build tu source"
-          fi
-          rm -rf "$work"
-
-      - name: Tai NNUE (bat buoc)
-        if: steps.cache-engine.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          curl -fsSL --retry 3 -o /tmp/abj.zip "$ABJ_ZIP_URL"
-          unzip -o -q /tmp/abj.zip -d /tmp/net
-          NNUE=$(find /tmp/net -name 'abjchess-*.nnue' | head -n1)
-          test -n "$NNUE"
-          cp "$NNUE" "$GITHUB_WORKSPACE/$(basename "$NNUE")"
-          echo "✅ NNUE: $(basename "$NNUE")"
+          mkdir -p /tmp/engines
+          tar -xzf /tmp/eng.tar.gz -C /tmp/engines pikafish-jieqi pikafish.nnue
+          chmod +x /tmp/engines/pikafish-jieqi
+          echo "✅ Pikafish-Jieqi lay tu mistboard release $TAG"
 
       - name: Smoke test engine
         run: |
           set -e
-          chmod +x AB-JChess
-          ls -la AB-JChess *.nnue
-          printf 'uci\nquit\n' | timeout 20 ./AB-JChess | head -n 8
-          test -s AB-JChess
-          ls *.nnue > /dev/null
+          ls -la /tmp/engines/pikafish-jieqi
+          printf 'uci\nquit\n' | timeout 20 /tmp/engines/pikafish-jieqi | head -n 5
+          test -s /tmp/engines/pikafish-jieqi
           echo "✅ Engine OK"
 
       # ---------- 4. KIEM TRA CU PHAP BOT ----------
