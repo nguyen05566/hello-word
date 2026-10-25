@@ -947,8 +947,7 @@ class JieqiCupBot:
         status = msg.read_byte()
         if status != 0:
             if self._joining_table:
-                self._joining_table = False; self.in_game = True
-                threading.Thread(target=lambda: (time.sleep(1.0), self.send_ready(1)), daemon=True).start()
+                self._joining_table = False
             return
         if self._joining_table:
             self._joining_table = False; self.in_game = True
