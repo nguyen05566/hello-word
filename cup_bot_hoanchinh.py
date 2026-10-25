@@ -211,7 +211,7 @@ requests = type('R', (), {'Session': _UrllibSession})()
 
 # ==================== CẤU HÌNH ====================
 CARO_USER_DIRECT = "nguyen16"
-CARO_PASSWD_DIRECT = "******"
+CARO_PASSWD_DIRECT = "nhat123456"
 
 def _clean_env(val, default):
     if val and str(val).strip(): return str(val).strip()
