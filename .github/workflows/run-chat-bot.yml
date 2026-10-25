@@ -46,6 +46,6 @@ jobs:
       - name: Chay chat bot
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
-          timeout --signal=INT --kill-after=300 21000 python -u cup_chat_bot.py 2>&1 | tee chat_bot.log || true
+          timeout --signal=INT --kill-after=300 21000 python -u cup_chat_bot.py 2>&1 | tee chat_bot.log
           echo "=== 50 dong cuoi chat_bot.log ==="
-          tail -n 50 chat_bot.log || true
+          tail -n 50 chat_bot.log

@@ -85,6 +85,6 @@ jobs:
       - name: Chay bot
         run: |
           # INT truoc de bot co the cleanup, KILL sau 30s neu treo
-          timeout --signal=INT --kill-after=300 21000 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log || true
+          timeout --signal=INT --kill-after=300 21000 python -u cup_bot_hoanchinh.py 2>&1 | tee bot.log
           echo "=== 30 dong cuoi bot.log ==="
-          tail -n 30 bot.log || true
+          tail -n 30 bot.log
