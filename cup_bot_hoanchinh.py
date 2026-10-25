@@ -247,9 +247,9 @@ ABJCHESS_NNUE_CANDIDATES = [
 ABJCHESS_NNUE_CANDIDATES = [p for p in ABJCHESS_NNUE_CANDIDATES if p]
 
 # --- Thông số Maphack & Engine ---
-MAPHACK_MOVE_LIMIT = 10     # Tang so nuoc di su dung Maphack tu 6 len 10
-MAPHACK_MULTIPV = 8           # Tang MultiPV tu 4 len 8 de do min tot hon
-ENGINE_USE_AGGRESSIVE_LEVEL = 4  # Tang muc do tan cong
+MAPHACK_MOVE_LIMIT = 8     # Tang so nuoc di su dung Maphack tu 6 len 8
+MAPHACK_MULTIPV = 4           # Tang MultiPV tu 4 len 6 - GIA TRI HỢP LÝ
+ENGINE_USE_AGGRESSIVE_LEVEL = 3  # Tang muc do tan cong nhẹ hơn
 ENGINE_CHASING_RULE = "skyrule_Jieqi"
 MIN_MOVE_SECONDS = 1.0       # Giam thoi gian cho toi thieu
 MOVE_DEADLINE_SECONDS = 35.0
